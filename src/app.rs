@@ -166,9 +166,11 @@ pub struct MiaoZipApp {
     #[serde(skip)]
     tree_icon_requested: HashSet<ShellIconKey>,
     #[serde(skip)]
-    tree_icon_requests: Option<mpsc::Sender<ShellIconKey>>,
+    tree_icon_generation: u64,
     #[serde(skip)]
-    tree_icon_results: Option<Receiver<(ShellIconKey, Option<Vec<u8>>)>>,
+    tree_icon_requests: Option<mpsc::Sender<(u64, ShellIconKey)>>,
+    #[serde(skip)]
+    tree_icon_results: Option<Receiver<(u64, ShellIconKey, Option<Vec<u8>>)>>,
     #[serde(skip)]
     reveal_tree_selection: bool,
     #[serde(skip)]
@@ -306,6 +308,7 @@ impl Default for MiaoZipApp {
             tree_children: HashMap::new(),
             tree_icon_cache: HashMap::new(),
             tree_icon_requested: HashSet::new(),
+            tree_icon_generation: 0,
             tree_icon_requests: None,
             tree_icon_results: None,
             reveal_tree_selection: false,
@@ -462,6 +465,15 @@ impl MiaoZipApp {
 
     fn is_running(&self) -> bool {
         matches!(self.status, JobStatus::Running { .. })
+    }
+
+    fn invalidate_shell_icons(&mut self) {
+        self.tree_icon_generation = self.tree_icon_generation.wrapping_add(1);
+        self.tree_icon_cache.clear();
+        self.tree_icon_requested.clear();
+        if let Some(receiver) = &self.tree_icon_results {
+            while receiver.try_recv().is_ok() {}
+        }
     }
 
     fn refresh_entries(&mut self) {
@@ -796,11 +808,18 @@ impl MiaoZipApp {
     }
 
     fn poll_archive_preview(&mut self) {
-        let result = self
-            .archive_preview_worker
-            .as_ref()
-            .and_then(|worker| worker.try_recv().ok());
-        let Some(result) = result else { return };
+        let Some(worker) = &self.archive_preview_worker else {
+            return;
+        };
+        let result = match worker.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.archive_preview_worker = None;
+                self.status = JobStatus::Error("包内文件预览任务意外中断".to_owned());
+                return;
+            }
+        };
         self.archive_preview_worker = None;
         match result {
             Ok((archive, temporary, file)) if self.opened_archive.as_ref() == Some(&archive) => {
@@ -1863,6 +1882,7 @@ impl MiaoZipApp {
                             });
                         match result {
                             Ok(remaining) => {
+                                self.invalidate_shell_icons();
                                 self.status = JobStatus::Success(if remaining.is_empty() {
                                     "已将支持的压缩格式设为妙压默认打开方式".to_owned()
                                 } else {
@@ -1892,6 +1912,7 @@ impl MiaoZipApp {
                         });
                         match result {
                             Ok(()) => {
+                                self.invalidate_shell_icons();
                                 self.status = JobStatus::Success(
                                     "已注册妙压打开方式，未更改默认程序".to_owned(),
                                 );
@@ -2067,6 +2088,7 @@ impl MiaoZipApp {
                         {
                             match integration::register_default_candidate() {
                                 Ok(()) => {
+                                    self.invalidate_shell_icons();
                                     self.status = JobStatus::Success(
                                         "支持的压缩格式已注册，未更改系统默认应用".to_owned(),
                                     );
@@ -2100,6 +2122,7 @@ impl MiaoZipApp {
                     if ui.button("将全部支持格式设为默认打开方式").clicked() {
                         match integration::set_default_associations() {
                             Ok(remaining) => {
+                                self.invalidate_shell_icons();
                                 self.status = JobStatus::Success(if remaining.is_empty() {
                                     "全部支持格式已设为妙压默认打开方式".to_owned()
                                 } else {
@@ -3087,6 +3110,13 @@ fn risky_external_file(path: &Path) -> bool {
         "desktop",
         "app",
         "applescript",
+        "docm",
+        "xlsm",
+        "pptm",
+        "reg",
+        "inf",
+        "cpl",
+        "scf",
     ]
     .iter()
     .any(|candidate| extension.eq_ignore_ascii_case(candidate))
@@ -3177,6 +3207,13 @@ mod tests {
             r"\\server\share\folder"
         );
         assert_eq!(strip_windows_verbatim_prefix(r"D:\Work"), r"D:\Work");
+    }
+
+    #[test]
+    fn warns_before_running_active_content_from_archive() {
+        assert!(risky_external_file(Path::new("inside/installer.EXE")));
+        assert!(risky_external_file(Path::new("inside/link.lnk")));
+        assert!(!risky_external_file(Path::new("inside/report.pdf")));
     }
 
     #[test]

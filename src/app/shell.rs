@@ -252,8 +252,14 @@ impl MiaoZipApp {
                                 }
                             }
                             4 => self.navigate_computer(),
-                            _ if self.opened_archive.is_some() => self.load_archive_listing(),
-                            _ => self.refresh_entries(),
+                            _ if self.opened_archive.is_some() => {
+                                self.invalidate_shell_icons();
+                                self.load_archive_listing();
+                            }
+                            _ => {
+                                self.invalidate_shell_icons();
+                                self.refresh_entries();
+                            }
                         }
                     }
                 }
@@ -740,7 +746,7 @@ impl MiaoZipApp {
             if self.tree_icon_requested.insert(key.clone())
                 && let Some(sender) = &self.tree_icon_requests
             {
-                let _ = sender.send(key);
+                let _ = sender.send((self.tree_icon_generation, key));
             }
         }
         #[cfg(not(windows))]
@@ -755,13 +761,13 @@ impl MiaoZipApp {
     pub(super) fn start_tree_icon_loader(&mut self, context: &egui::Context) {
         #[cfg(windows)]
         {
-            let (request_sender, request_receiver) = mpsc::channel::<ShellIconKey>();
+            let (request_sender, request_receiver) = mpsc::channel::<(u64, ShellIconKey)>();
             let (result_sender, result_receiver) = mpsc::channel();
             let context = context.clone();
             thread::spawn(move || {
-                for key in request_receiver {
+                for (generation, key) in request_receiver {
                     let icon = windows_tree_icons::load(&key);
-                    if result_sender.send((key, icon)).is_err() {
+                    if result_sender.send((generation, key, icon)).is_err() {
                         break;
                     }
                     context.request_repaint();
@@ -776,7 +782,10 @@ impl MiaoZipApp {
 
     fn poll_tree_icons(&mut self, context: &egui::Context) {
         if let Some(receiver) = &self.tree_icon_results {
-            while let Ok((key, icon)) = receiver.try_recv() {
+            while let Ok((generation, key, icon)) = receiver.try_recv() {
+                if generation != self.tree_icon_generation {
+                    continue;
+                }
                 if let Some(rgba) = icon {
                     let image = egui::ColorImage::from_rgba_unmultiplied([20, 20], &rgba);
                     let texture = context.load_texture(
@@ -898,6 +907,23 @@ impl MiaoZipApp {
             display_path(path.parent().unwrap_or(path))
         ));
         lines
+    }
+
+    fn activate_file_entry(&mut self, entry: FileEntry) {
+        if self.opened_archive.is_some() && entry.is_directory {
+            self.enter_archive_directory(&entry.path);
+        } else if self.opened_archive.is_some() {
+            self.request_open_archive_entry(entry.path);
+        } else if entry.is_directory {
+            self.navigate_to(entry.path);
+        } else if is_archive_file(&entry.path) {
+            self.open_archive(entry.path);
+        } else {
+            self.status = match crate::system_open::open_file(&entry.path) {
+                Ok(()) => JobStatus::Success("已交给系统默认应用打开文件".to_owned()),
+                Err(error) => JobStatus::Error(format!("无法打开文件：{error}")),
+            };
+        }
     }
 
     fn show_classic_list(&mut self, root: &mut egui::Ui) {
@@ -1164,18 +1190,19 @@ impl MiaoZipApp {
                             }
                         }
                         if response.double_clicked() {
-                            if self.opened_archive.is_some() && entry.is_directory {
-                                self.enter_archive_directory(&entry.path);
-                            } else if self.opened_archive.is_some() {
-                                self.request_open_archive_entry(entry.path);
-                            } else if entry.is_directory {
-                                self.navigate_to(entry.path);
-                            } else if is_archive_file(&entry.path) {
-                                self.open_archive(entry.path);
-                            } else if let Err(error) = crate::system_open::open_file(&entry.path) {
-                                self.status = JobStatus::Error(format!("无法打开文件：{error}"));
-                            }
+                            self.activate_file_entry(entry.clone());
                         }
+                        response.context_menu(|ui| {
+                            let title = if entry.is_directory {
+                                "打开文件夹"
+                            } else {
+                                "打开"
+                            };
+                            if ui.button(title).clicked() {
+                                self.activate_file_entry(entry.clone());
+                                ui.close();
+                            }
+                        });
                     }
                     if let Some(error) = &self.browser_error {
                         label(
@@ -2183,11 +2210,11 @@ fn drive_info(_path: &Path) -> (Option<u64>, Option<u64>, String) {
 
 #[cfg(windows)]
 mod windows_tree_icons {
-    use super::ShellIconKey;
+    use super::{ShellIconKey, display_path};
     use std::ffi::c_void;
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     const SIZE: usize = 20;
 
@@ -2267,9 +2294,10 @@ mod windows_tree_icons {
 
     pub(super) fn load(key: &ShellIconKey) -> Option<Vec<u8>> {
         let (path, attributes, flags) = match key {
-            ShellIconKey::Real(path) => (path.clone(), 0, 0x100 | 0x1 | 0x20),
+            ShellIconKey::Real(path) => (PathBuf::from(display_path(path)), 0, 0x100 | 0x1 | 0x20),
             ShellIconKey::VirtualFile(extension) => {
-                (Path::new(extension).to_path_buf(), 0x80, 0x100 | 0x1 | 0x10)
+                let sample = format!("file{extension}");
+                (PathBuf::from(sample), 0x80, 0x100 | 0x1 | 0x10)
             }
             ShellIconKey::VirtualFolder => {
                 (Path::new("folder").to_path_buf(), 0x10, 0x100 | 0x1 | 0x10)
@@ -2392,6 +2420,18 @@ mod tests {
         app.push_tree_path(&mut rows, "parent".to_owned(), parent, 5, 0);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].path.as_ref(), Some(&child));
+    }
+
+    #[test]
+    fn archived_files_use_their_associated_extension_icon() {
+        assert_eq!(
+            archive_icon_key(Path::new("folder/report.PDF"), false),
+            ShellIconKey::VirtualFile(".pdf".to_owned())
+        );
+        assert_eq!(
+            archive_icon_key(Path::new("folder"), true),
+            ShellIconKey::VirtualFolder
+        );
     }
 
     #[cfg(windows)]

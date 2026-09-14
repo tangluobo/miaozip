@@ -235,25 +235,67 @@ mod tests {
     }
 
     #[test]
-    fn refuses_oversized_zip_preview_before_creating_file() {
+    fn refuses_oversized_preview_before_creating_file() {
         let workspace = tempfile::tempdir().unwrap();
-        let archive_path = workspace.path().join("large.zip");
-        let mut archive = ZipWriter::new(File::create(&archive_path).unwrap());
-        archive
-            .start_file("large.bin", SimpleFileOptions::default())
-            .unwrap();
-        archive.write_all(&[0u8; 1024]).unwrap();
-        archive.finish().unwrap();
-        let destination = workspace.path().join("preview");
         // The limited-copy helper must reject a stream that exceeds its stated cap.
         assert!(
             copy_limited(
                 &mut &[0u8; 4][..],
-                &destination.join("tiny"),
+                &workspace.path().join("tiny"),
                 Some(MAX_OPEN_BYTES + 1)
             )
             .is_err()
         );
-        assert!(!destination.join("tiny").exists());
+        assert!(!workspace.path().join("tiny").exists());
+    }
+
+    #[test]
+    fn opens_one_entry_from_each_creatable_format() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("readme.txt");
+        fs::write(&source, b"preview content").unwrap();
+        for format in ArchiveFormat::CREATABLE {
+            let archive_path = workspace
+                .path()
+                .join(format!("sample{}", format.extension()));
+            create_archive(&[source.clone()], &archive_path, format, 6, |_| {}).unwrap();
+            let destination = workspace.path().join(format!("open-{}", format.label()));
+            let opened = extract_entry_for_open(&archive_path, "readme.txt", &destination).unwrap();
+            assert_eq!(
+                fs::read(opened).unwrap(),
+                b"preview content",
+                "{}",
+                format.label()
+            );
+        }
+    }
+
+    #[test]
+    fn opens_rar_entry() {
+        const RAR_HEX: &str = "526172211A0700CF907300000D000000000000000F0C7420802700150000000B0000000345F37DC6A48A07471D330700A481000056455253494F4E0C008FEC8A45CC23C848088362FE5FDD5C5388F072C43D7B00400700";
+        let workspace = tempfile::tempdir().unwrap();
+        let archive_path = workspace.path().join("sample.rar");
+        let bytes: Vec<u8> = (0..RAR_HEX.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&RAR_HEX[index..index + 2], 16).unwrap())
+            .collect();
+        fs::write(&archive_path, bytes).unwrap();
+        let opened =
+            extract_entry_for_open(&archive_path, "VERSION", &workspace.path().join("open"))
+                .unwrap();
+        assert_eq!(fs::read(opened).unwrap(), b"unrar-0.4.0");
+    }
+
+    #[test]
+    fn opens_single_stream_entry() {
+        let workspace = tempfile::tempdir().unwrap();
+        let archive_path = workspace.path().join("message.gz");
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(b"hello").unwrap();
+        fs::write(&archive_path, encoder.finish().unwrap()).unwrap();
+        let opened =
+            extract_entry_for_open(&archive_path, "message", &workspace.path().join("open"))
+                .unwrap();
+        assert_eq!(fs::read(opened).unwrap(), b"hello");
     }
 }
