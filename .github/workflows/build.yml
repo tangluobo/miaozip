@@ -1,0 +1,104 @@
+name: Build desktop binaries
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: i686-pc-windows-msvc
+            archive_ext: zip
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            archive_ext: zip
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive_ext: tar.gz
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            archive_ext: tar.gz
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            archive_ext: tar.gz
+    env:
+      CARGO_BUILD_JOBS: 2
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Linux desktop build dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang libclang-dev pkg-config \
+            libgtk-3-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libssl-dev liblzma-dev
+
+      - name: Install Rust target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Test
+        run: cargo test --locked --target ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $targetTriple = '${{ matrix.target }}'
+          $packageDir = Join-Path $env:RUNNER_TEMP 'miaozip-package'
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          Copy-Item -LiteralPath "target\$targetTriple\release\miaozip.exe" -Destination $packageDir
+          Copy-Item -LiteralPath 'README.md', 'LICENSE' -Destination $packageDir
+          Compress-Archive -Path (Join-Path $packageDir '*') -DestinationPath "miaozip-$targetTriple.zip" -Force
+
+      - name: Package Linux or macOS binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          target_triple='${{ matrix.target }}'
+          mkdir -p miaozip-package
+          install -m 755 "target/$target_triple/release/miaozip" miaozip-package/miaozip
+          cp README.md LICENSE miaozip-package/
+          tar -czf "miaozip-$target_triple.tar.gz" -C miaozip-package .
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: miaozip-${{ matrix.target }}
+          path: miaozip-${{ matrix.target }}.${{ matrix.archive_ext }}
+          if-no-files-found: error
+          retention-days: 14
