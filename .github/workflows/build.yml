@@ -192,6 +192,8 @@ jobs:
             appimage_arch: aarch64
     env:
       CARGO_BUILD_JOBS: 2
+      DEBIAN_FRONTEND: noninteractive
+      TZ: Etc/UTC
 
     steps:
       - name: Check out source
