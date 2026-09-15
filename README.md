@@ -75,7 +75,15 @@ cargo build --release
 | macOS | Intel x64 | `x86_64-apple-darwin` |
 | macOS | Apple Silicon ARM64 | `aarch64-apple-darwin` |
 
-Windows 产物为 ZIP 包，Linux/macOS 为 TAR.GZ 包，内含可执行文件、README 和许可证。它们是未签名的便携构建，不是安装程序或 macOS `.app` 包。Linux 需要目标系统具备相应桌面和图形运行库；32 位 Linux 与 ARMv7 没有列入此矩阵，避免把尚未验证的 GUI 交叉编译目标标称为可用。
+每个架构的 Actions Artifact 都包含多种分发形式：
+
+| 系统 | 便携产物 | 安装产物 |
+| --- | --- | --- |
+| Windows | 独立 `.exe`、`.zip` | `.msi` |
+| Linux | 独立二进制、`.tar.gz` | `.deb`、`.rpm` |
+| macOS | 独立二进制、`.app.zip` | `.dmg`、`.pkg` |
+
+这些 CI 产物尚未进行商业代码签名或 Apple 公证，因此操作系统可能显示安全提醒。Linux 安装包包含桌面启动项和图标；macOS 的 APP、DMG 与 PKG 使用标准应用包结构。Linux 需要目标系统具备相应桌面和图形运行库；32 位 Linux 与 ARMv7 没有列入此矩阵，避免把尚未验证的 GUI 交叉编译目标标称为可用。
 
 ## 各平台准备
 

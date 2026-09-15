@@ -7,10 +7,14 @@ const DRAW_SCALE: u32 = 2;
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
-    let icon = image::imageops::resize(&draw_icon(), ICON_SIZE, ICON_SIZE, FilterType::Lanczos3);
+    let artwork = draw_icon();
+    let icon = image::imageops::resize(&artwork, ICON_SIZE, ICON_SIZE, FilterType::Lanczos3);
     fs::write(output.join("miaozip-icon.rgba"), icon.as_raw()).expect("write RGBA icon");
     icon.save(output.join("miaozip-icon.png"))
         .expect("write icon preview");
+    image::imageops::resize(&artwork, 1024, 1024, FilterType::Lanczos3)
+        .save(output.join("miaozip-icon-1024.png"))
+        .expect("write installer icon");
 
     let sizes = [16, 32, 48, 256];
     let images: Vec<Vec<u8>> = sizes

@@ -1,7 +1,7 @@
 /target/
+/dist/
 *.zip
 *.zipdesk-part
 .DS_Store
 .codex-toolchain
 Thumbs.db
-

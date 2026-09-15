@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=妙压
+GenericName=Archive Manager
+Comment=Create, browse and extract archive files
+Exec=miaozip %f
+Icon=miaozip
+Terminal=false
+Categories=Utility;Archiving;
+MimeType=application/zip;application/x-7z-compressed;application/vnd.rar;application/x-tar;application/gzip;application/x-bzip2;application/x-xz;application/zstd;
+StartupNotify=true

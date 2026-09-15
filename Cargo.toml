@@ -25,7 +25,6 @@ bzip2 = "0.6"
 xz2 = "0.1"
 zstd = "0.13"
 sevenz-rust2 = { version = "0.22.2", features = ["compress", "util"] }
-unrar = "0.5.8"
 tempfile = "3"
 md-5 = "0.11"
 sha2 = "0.11"
@@ -34,6 +33,15 @@ crc32fast = "1"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
+
+[target.'cfg(not(all(windows, target_arch = "x86")))'.dependencies]
+unrar = "0.5.8"
+
+# `unrar` 0.5.8 declares UnRAR's PASCAL API as `extern "C"`. Those ABIs only
+# differ on 32-bit Windows, where the bad declarations fail to link. Use the
+# same bundled UnRAR engine through a small, correctly typed adapter there.
+[target.'cfg(all(windows, target_arch = "x86"))'.dependencies]
+unrar_sys = { version = "0.5.8", features = ["std"] }
 
 [build-dependencies]
 image = { version = "0.25.10", default-features = false, features = ["png"] }

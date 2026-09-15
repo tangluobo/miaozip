@@ -19,25 +19,18 @@ jobs:
         include:
           - runner: windows-2025
             target: i686-pc-windows-msvc
-            archive_ext: zip
           - runner: windows-2025
             target: x86_64-pc-windows-msvc
-            archive_ext: zip
           - runner: windows-11-arm
             target: aarch64-pc-windows-msvc
-            archive_ext: zip
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            archive_ext: tar.gz
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            archive_ext: tar.gz
           - runner: macos-15-intel
             target: x86_64-apple-darwin
-            archive_ext: tar.gz
           - runner: macos-15
             target: aarch64-apple-darwin
-            archive_ext: tar.gz
     env:
       CARGO_BUILD_JOBS: 2
 
@@ -54,7 +47,7 @@ jobs:
             build-essential clang libclang-dev pkg-config \
             libgtk-3-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libssl-dev liblzma-dev
+            libssl-dev liblzma-dev rpm file
 
       - name: Install Rust target
         uses: dtolnay/rust-toolchain@stable
@@ -72,33 +65,34 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release --target ${{ matrix.target }}
 
-      - name: Package Windows binary
+      - name: Install WiX Toolset
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $targetTriple = '${{ matrix.target }}'
-          $packageDir = Join-Path $env:RUNNER_TEMP 'miaozip-package'
-          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
-          Copy-Item -LiteralPath "target\$targetTriple\release\miaozip.exe" -Destination $packageDir
-          Copy-Item -LiteralPath 'README.md', 'LICENSE' -Destination $packageDir
-          Compress-Archive -Path (Join-Path $packageDir '*') -DestinationPath "miaozip-$targetTriple.zip" -Force
+          $toolPath = Join-Path $env:RUNNER_TEMP 'wix'
+          dotnet tool install --tool-path $toolPath wix --version 5.0.2
+          "WIX_EXE=$(Join-Path $toolPath 'wix.exe')" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Package Linux or macOS binary
-        if: runner.os != 'Windows'
+      - name: Package Windows distributions
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: packaging\windows\package.ps1 -Target '${{ matrix.target }}' -WixExe $env:WIX_EXE
+
+      - name: Package Linux distributions
+        if: runner.os == 'Linux'
         shell: bash
-        run: |
-          set -euo pipefail
-          target_triple='${{ matrix.target }}'
-          mkdir -p miaozip-package
-          install -m 755 "target/$target_triple/release/miaozip" miaozip-package/miaozip
-          cp README.md LICENSE miaozip-package/
-          tar -czf "miaozip-$target_triple.tar.gz" -C miaozip-package .
+        run: bash packaging/linux/package.sh '${{ matrix.target }}'
 
-      - name: Upload binary artifact
+      - name: Package macOS distributions
+        if: runner.os == 'macOS'
+        shell: bash
+        run: bash packaging/macos/package.sh '${{ matrix.target }}'
+
+      - name: Upload distribution artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: miaozip-${{ matrix.target }}
-          path: miaozip-${{ matrix.target }}.${{ matrix.archive_ext }}
+          name: miaozip-${{ matrix.target }}-packages
+          path: dist/${{ matrix.target }}/*
           if-no-files-found: error
           retention-days: 14

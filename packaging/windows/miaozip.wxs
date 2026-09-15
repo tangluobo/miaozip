@@ -1,0 +1,42 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="妙压"
+    Manufacturer="MiaoZip Contributors"
+    Version="$(var.Version)"
+    UpgradeCode="B0979E27-F46C-47A7-ABF7-C423AA51D5D1"
+    Scope="perMachine">
+    <SummaryInformation Description="妙压压缩文件管理器" />
+    <MajorUpgrade DowngradeErrorMessage="已安装更新版本的妙压。" />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="MiaoZipIcon" SourceFile="$(var.IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="MiaoZipIcon" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="MiaoZip" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="APPLICATIONPROGRAMSFOLDER" Name="妙压" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <Component Id="ApplicationFiles" Guid="*">
+        <File Id="MiaoZipExecutable" Source="$(var.BinaryPath)" Name="miaozip.exe" KeyPath="yes">
+          <Shortcut
+            Id="StartMenuShortcut"
+            Directory="APPLICATIONPROGRAMSFOLDER"
+            Name="妙压"
+            Description="妙压压缩文件管理器"
+            WorkingDirectory="INSTALLFOLDER"
+            Icon="MiaoZipIcon"
+            Advertise="no" />
+        </File>
+        <File Id="LicenseFile" Source="$(var.LicensePath)" Name="LICENSE.txt" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="MainFeature" Title="妙压" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+    </Feature>
+  </Package>
+</Wix>

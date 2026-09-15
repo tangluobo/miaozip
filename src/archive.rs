@@ -10,6 +10,8 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 mod preview;
+#[cfg(all(windows, target_arch = "x86"))]
+mod rar_win32;
 pub use preview::extract_entry_for_open;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -171,16 +173,32 @@ pub fn list_archive_entries(archive_path: &Path) -> Result<Vec<ArchiveListEntry>
             }
         }
         ArchiveFormat::Rar => {
-            let archive = unrar::Archive::new(archive_path)
-                .open_for_listing()
-                .context("文件不是有效的 RAR 压缩包")?;
-            for entry in archive {
-                let entry = entry.context("无法读取 RAR 文件目录")?;
-                result.push(ArchiveListEntry::new(
-                    &entry.filename.to_string_lossy(),
-                    entry.is_directory(),
-                    Some(entry.unpacked_size),
-                )?);
+            #[cfg(not(all(windows, target_arch = "x86")))]
+            {
+                let archive = unrar::Archive::new(archive_path)
+                    .open_for_listing()
+                    .context("文件不是有效的 RAR 压缩包")?;
+                for entry in archive {
+                    let entry = entry.context("无法读取 RAR 文件目录")?;
+                    result.push(ArchiveListEntry::new(
+                        &entry.filename.to_string_lossy(),
+                        entry.is_directory(),
+                        Some(entry.unpacked_size),
+                    )?);
+                }
+            }
+            #[cfg(all(windows, target_arch = "x86"))]
+            {
+                let mut archive = rar_win32::Archive::open_for_listing(archive_path)
+                    .context("文件不是有效的 RAR 压缩包")?;
+                while let Some(entry) = archive.read_header()? {
+                    result.push(ArchiveListEntry::new(
+                        &entry.name,
+                        entry.is_directory,
+                        Some(entry.unpacked_size),
+                    )?);
+                    archive.skip()?;
+                }
             }
         }
         ArchiveFormat::Gzip | ArchiveFormat::Bzip2 | ArchiveFormat::Xz | ArchiveFormat::Zstd => {
@@ -537,6 +555,7 @@ fn extract_7z_archive(
     Ok(summary)
 }
 
+#[cfg(not(all(windows, target_arch = "x86")))]
 fn extract_rar_archive(
     archive_path: &Path,
     destination: &Path,
@@ -599,6 +618,76 @@ fn extract_rar_archive(
             completed,
             total,
             current: name,
+        });
+    }
+    Ok(summary)
+}
+
+#[cfg(all(windows, target_arch = "x86"))]
+fn extract_rar_archive(
+    archive_path: &Path,
+    destination: &Path,
+    mut on_progress: impl FnMut(Progress),
+) -> Result<OperationSummary> {
+    let mut listing =
+        rar_win32::Archive::open_for_listing(archive_path).context("文件不是有效的 RAR 压缩包")?;
+    let mut total = 0;
+    while let Some(header) = listing.read_header()? {
+        safe_archive_name(&header.name)?;
+        if header.is_encrypted {
+            bail!("暂不支持加密 RAR：{}", header.name);
+        }
+        if header.is_redirection {
+            bail!("为安全起见，不解压 RAR 链接或重定向项：{}", header.name);
+        }
+        total += 1;
+        listing.skip()?;
+    }
+
+    let staging = tempfile::tempdir().context("无法建立 RAR 解压临时目录")?;
+    fs::create_dir_all(destination)
+        .with_context(|| format!("无法创建解压目录：{}", destination.display()))?;
+    let canonical_root = destination.canonicalize()?;
+    let mut archive =
+        rar_win32::Archive::open_for_processing(archive_path).context("无法打开 RAR 进行解压")?;
+    let mut summary = OperationSummary::default();
+    let mut completed = 0;
+    while let Some(header) = archive.read_header()? {
+        let relative = safe_archive_name(&header.name)?;
+        let output = destination.join(relative);
+        on_progress(Progress {
+            completed,
+            total,
+            current: header.name.clone(),
+        });
+
+        if header.is_directory {
+            create_safe_directory(destination, &output, &canonical_root)?;
+            summary.directories += 1;
+            archive.skip()?;
+        } else {
+            let stage_path = staging.path().join(format!("entry-{completed}"));
+            archive
+                .extract_to(&stage_path)
+                .with_context(|| format!("无法解压 RAR 项：{}", header.name))?;
+            if !fs::symlink_metadata(&stage_path)?.file_type().is_file() {
+                bail!("为安全起见，不解压 RAR 链接或特殊文件：{}", header.name);
+            }
+            let parent = output
+                .parent()
+                .ok_or_else(|| anyhow!("无效的输出路径：{}", header.name))?;
+            create_safe_directory(destination, parent, &canonical_root)?;
+            reject_symlink(&output)?;
+            summary.bytes += fs::copy(&stage_path, &output)
+                .with_context(|| format!("无法写入解压文件：{}", output.display()))?;
+            summary.files += 1;
+        }
+
+        completed += 1;
+        on_progress(Progress {
+            completed,
+            total,
+            current: header.name,
         });
     }
     Ok(summary)

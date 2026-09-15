@@ -119,6 +119,7 @@ fn extract_7z_entry(archive_path: &Path, requested: &Path, output: &Path) -> Res
     Ok(())
 }
 
+#[cfg(not(all(windows, target_arch = "x86")))]
 fn extract_rar_entry(
     archive_path: &Path,
     requested: &Path,
@@ -150,6 +151,42 @@ fn extract_rar_entry(
             bail!("拒绝打开 RAR 链接、特殊文件或超过 256 MiB 的文件：{name}");
         }
         fs::rename(&staged_file, output)?;
+        return Ok(());
+    }
+    bail!("压缩包内找不到所选文件：{}", requested.display())
+}
+
+#[cfg(all(windows, target_arch = "x86"))]
+fn extract_rar_entry(
+    archive_path: &Path,
+    requested: &Path,
+    output: &Path,
+    _destination: &Path,
+) -> Result<()> {
+    let mut archive = rar_win32::Archive::open_for_processing(archive_path)
+        .context("文件不是有效的 RAR 压缩包")?;
+    while let Some(header) = archive.read_header()? {
+        if safe_archive_name(&header.name)? != requested {
+            archive.skip()?;
+            continue;
+        }
+        if header.is_directory || header.is_encrypted || header.is_redirection {
+            bail!("不能直接打开 RAR 目录、加密文件或链接：{}", header.name);
+        }
+        if header.unpacked_size > MAX_OPEN_BYTES {
+            bail!("单文件预览上限为 256 MiB，请先手动解压");
+        }
+        archive
+            .extract_to(output)
+            .with_context(|| format!("无法解压 RAR 项：{}", header.name))?;
+        let metadata = fs::symlink_metadata(output)?;
+        if !metadata.file_type().is_file() || metadata.len() > MAX_OPEN_BYTES {
+            let _ = fs::remove_file(output);
+            bail!(
+                "拒绝打开 RAR 链接、特殊文件或超过 256 MiB 的文件：{}",
+                header.name
+            );
+        }
         return Ok(());
     }
     bail!("压缩包内找不到所选文件：{}", requested.display())
