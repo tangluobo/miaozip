@@ -63,7 +63,7 @@ cargo build --release
 
 ## GitHub Actions 跨平台构建
 
-[构建工作流](.github/workflows/build.yml)会在推送、Pull Request 和手动触发时，对以下目标分别运行测试与 Release 构建，并上传可下载的 Actions Artifact：
+[构建工作流](.github/workflows/build.yml)会在推送、Pull Request 和手动触发时，对以下目标分别运行测试、Release 构建与原生打包，并上传可下载的 Actions Artifact：
 
 | 系统 | 架构 | Rust 目标 |
 | --- | --- | --- |
@@ -79,11 +79,13 @@ cargo build --release
 
 | 系统 | 便携产物 | 安装产物 |
 | --- | --- | --- |
-| Windows | 独立 `.exe`、`.zip` | `.msi` |
-| Linux | 独立二进制、`.tar.gz` | `.deb`、`.rpm` |
-| macOS | 独立二进制、`.app.zip` | `.dmg`、`.pkg` |
+| Windows | `.zip`、`.tar.gz` | NSIS `.exe`、WiX `.msi` |
+| Linux | `.zip`、`.tar.gz` | `.deb`、`.rpm`、`.AppImage` |
+| macOS | `.zip`、`.tar.gz`（均包含 `.app`） | `.dmg`、`.pkg` |
 
-这些 CI 产物尚未进行商业代码签名或 Apple 公证，因此操作系统可能显示安全提醒。Linux 安装包包含桌面启动项和图标；macOS 的 APP、DMG 与 PKG 使用标准应用包结构。Linux 需要目标系统具备相应桌面和图形运行库；32 位 Linux 与 ARMv7 没有列入此矩阵，避免把尚未验证的 GUI 交叉编译目标标称为可用。
+产物使用 `miaozip-<版本>-<系统>-<架构>.<格式>` 统一命名。推送 `v*` 标签或手动填写与 `Cargo.toml` 一致的发行版本时，工作流会汇总所有平台产物、生成 `SHA256SUMS.txt` 并创建 GitHub Release。普通分支推送和 Pull Request 只生成 Actions Artifact，不创建 Release。
+
+这些 CI 产物尚未进行商业代码签名或 Apple 公证，因此操作系统可能显示安全提醒。Windows 的 `.exe` 是图形化安装程序而非裸可执行文件；Linux 安装包包含桌面启动项和图标；macOS 的 ZIP、tar.gz、DMG 与 PKG 使用标准应用包结构。Linux 需要目标系统具备相应桌面和图形运行库；32 位 Linux 与 ARMv7 没有列入此矩阵，避免把尚未验证的 GUI 交叉编译目标标称为可用。
 
 ## 各平台准备
 

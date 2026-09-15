@@ -1,16 +1,36 @@
-name: Build desktop binaries
+name: Build and release desktop packages
 
 on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Release version, for example v1.0.2"
+        required: true
+        type: string
+      release_name:
+        description: "Release display name"
+        required: false
+        type: string
+        default: ""
+      draft:
+        description: "Create as draft?"
+        required: false
+        type: boolean
+        default: false
+      release_notes:
+        description: "Additional release notes (markdown)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: ${{ matrix.target }}
+    name: ${{ matrix.platform }}-${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
@@ -18,41 +38,103 @@ jobs:
       matrix:
         include:
           - runner: windows-2025
+            platform: windows
+            arch: x86
             target: i686-pc-windows-msvc
           - runner: windows-2025
+            platform: windows
+            arch: x86_64
             target: x86_64-pc-windows-msvc
           - runner: windows-11-arm
+            platform: windows
+            arch: arm64
             target: aarch64-pc-windows-msvc
           - runner: ubuntu-24.04
+            platform: linux
+            arch: x86_64
             target: x86_64-unknown-linux-gnu
+            appimage_arch: x86_64
           - runner: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
             target: aarch64-unknown-linux-gnu
+            appimage_arch: aarch64
           - runner: macos-15-intel
+            platform: macos
+            arch: x86_64
             target: x86_64-apple-darwin
           - runner: macos-15
+            platform: macos
+            arch: arm64
             target: aarch64-apple-darwin
     env:
       CARGO_BUILD_JOBS: 2
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
 
-      - name: Install Linux desktop build dependencies
-        if: runner.os == 'Linux'
+      - name: Install Linux desktop and packaging dependencies
+        if: matrix.platform == 'linux'
         shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential clang libclang-dev pkg-config \
             libgtk-3-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libssl-dev liblzma-dev rpm file
+            libssl-dev liblzma-dev rpm file zip
+          sudo curl --fail --location --retry 3 \
+            --output /usr/local/bin/appimagetool \
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${{ matrix.appimage_arch }}.AppImage"
+          sudo chmod +x /usr/local/bin/appimagetool
+
+      - name: Install Windows packaging dependencies
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $toolPath = Join-Path $env:RUNNER_TEMP 'wix'
+          dotnet tool install --tool-path $toolPath wix --version 5.0.2
+          "WIX_EXE=$(Join-Path $toolPath 'wix.exe')" | Out-File -FilePath $env:GITHUB_ENV -Append
+          choco install nsis --version=3.12.0 -y --no-progress
+          if ($LASTEXITCODE -notin @(0, 3010)) { exit $LASTEXITCODE }
+          $makeNsis = Get-Command makensis.exe -ErrorAction SilentlyContinue
+          if ($null -ne $makeNsis) {
+            $makeNsis = $makeNsis.Source
+          } else {
+            $makeNsis = @(
+              'C:\Program Files (x86)\NSIS\makensis.exe',
+              'C:\Program Files\NSIS\makensis.exe'
+            ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          }
+          if (-not $makeNsis) { throw 'makensis.exe was not found after installing NSIS' }
+          "MAKENSIS_EXE=$makeNsis" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Install Rust target
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Resolve and verify version
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.release_version || (startsWith(github.ref, 'refs/tags/v') && github.ref_name || '') }}
+        run: |
+          set -euo pipefail
+          VERSION=$(cargo metadata --locked --no-deps --format-version 1 |
+            python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          if [ -n "$REQUESTED_VERSION" ]; then
+            EXPECTED_VERSION=${REQUESTED_VERSION#v}
+            if [ "$VERSION" != "$EXPECTED_VERSION" ]; then
+              echo "Cargo version $VERSION does not match requested release $EXPECTED_VERSION" >&2
+              exit 1
+            fi
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Cache Cargo build
         uses: Swatinem/rust-cache@v2
@@ -65,34 +147,163 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release --target ${{ matrix.target }}
 
-      - name: Install WiX Toolset
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $toolPath = Join-Path $env:RUNNER_TEMP 'wix'
-          dotnet tool install --tool-path $toolPath wix --version 5.0.2
-          "WIX_EXE=$(Join-Path $toolPath 'wix.exe')" | Out-File -FilePath $env:GITHUB_ENV -Append
-
       - name: Package Windows distributions
-        if: runner.os == 'Windows'
+        if: matrix.platform == 'windows'
         shell: pwsh
-        run: packaging\windows\package.ps1 -Target '${{ matrix.target }}' -WixExe $env:WIX_EXE
+        run: >-
+          packaging\windows\package.ps1
+          -Target '${{ matrix.target }}'
+          -Architecture '${{ matrix.arch }}'
+          -Version $env:VERSION
+          -WixExe $env:WIX_EXE
+          -MakeNsisExe $env:MAKENSIS_EXE
 
       - name: Package Linux distributions
-        if: runner.os == 'Linux'
+        if: matrix.platform == 'linux'
         shell: bash
-        run: bash packaging/linux/package.sh '${{ matrix.target }}'
+        run: >-
+          bash packaging/linux/package.sh
+          '${{ matrix.target }}'
+          '${{ matrix.arch }}'
+          '${{ matrix.appimage_arch }}'
+          "$VERSION"
 
       - name: Package macOS distributions
-        if: runner.os == 'macOS'
+        if: matrix.platform == 'macos'
         shell: bash
-        run: bash packaging/macos/package.sh '${{ matrix.target }}'
+        run: >-
+          bash packaging/macos/package.sh
+          '${{ matrix.target }}'
+          '${{ matrix.arch }}'
+          "$VERSION"
 
-      - name: Upload distribution artifacts
+      - name: Verify Windows artifacts
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $base = "dist/miaozip-$env:VERSION-windows-${{ matrix.arch }}"
+          @('.zip', '.tar.gz', '.exe', '.msi') | ForEach-Object {
+            $file = "$base$_"
+            if (-not (Test-Path -LiteralPath $file)) { throw "Missing artifact: $file" }
+            if ((Get-Item -LiteralPath $file).Length -eq 0) { throw "Empty artifact: $file" }
+            Get-Item -LiteralPath $file | Select-Object Name, Length
+          }
+
+      - name: Verify Linux artifacts
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="dist/miaozip-${VERSION}-linux-${{ matrix.arch }}"
+          for suffix in .zip .tar.gz .deb .rpm .AppImage; do
+            test -s "${base}${suffix}" || { echo "Missing artifact: ${base}${suffix}" >&2; exit 1; }
+          done
+          ls -lh dist/
+
+      - name: Verify macOS artifacts
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="dist/miaozip-${VERSION}-macos-${{ matrix.arch }}"
+          for suffix in .zip .tar.gz .dmg .pkg; do
+            test -s "${base}${suffix}" || { echo "Missing artifact: ${base}${suffix}" >&2; exit 1; }
+          done
+          ls -lh dist/
+
+      - name: Upload platform artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: miaozip-${{ matrix.target }}-packages
-          path: dist/${{ matrix.target }}/*
+          name: miaozip-${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/*
           if-no-files-found: error
           retention-days: 14
+
+  release:
+    name: Create GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts and calculate SHA256
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release_files
+          while IFS= read -r -d '' file; do
+            name=$(basename "$file")
+            if [ -e "release_files/$name" ]; then
+              echo "Duplicate release artifact: $name" >&2
+              exit 1
+            fi
+            cp "$file" "release_files/$name"
+          done < <(find artifacts -type f -print0)
+          (cd release_files && sha256sum * > SHA256SUMS.txt)
+
+      - name: Resolve release information
+        id: release_info
+        shell: bash
+        env:
+          RAW_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.release_version || github.ref_name }}
+          INPUT_RELEASE_NAME: ${{ inputs.release_name }}
+        run: |
+          set -euo pipefail
+          VERSION=${RAW_VERSION#v}
+          TAG="v${VERSION}"
+          NAME=${INPUT_RELEASE_NAME:-$TAG}
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes
+        shell: bash
+        env:
+          EXTRA_NOTES: ${{ inputs.release_notes }}
+        run: |
+          cat > release_body.md << BODYEOF
+          ## MiaoZip ${{ steps.release_info.outputs.version }}
+
+          | Platform | Architecture | Packages |
+          |----------|--------------|----------|
+          | Windows | x86 | ZIP / tar.gz / EXE / MSI |
+          | Windows | x86_64 | ZIP / tar.gz / EXE / MSI |
+          | Windows | arm64 | ZIP / tar.gz / EXE / MSI |
+          | Linux | x86_64 | ZIP / tar.gz / DEB / RPM / AppImage |
+          | Linux | arm64 | ZIP / tar.gz / DEB / RPM / AppImage |
+          | macOS | x86_64 | ZIP / tar.gz / DMG / PKG |
+          | macOS | arm64 | ZIP / tar.gz / DMG / PKG |
+
+          - Commit: ${{ steps.release_info.outputs.commit }}
+          - Build date: ${{ steps.release_info.outputs.build_date }}
+          - Rust toolchain: stable
+
+          Checksums for every package are in `SHA256SUMS.txt`.
+
+          ${EXTRA_NOTES}
+          BODYEOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_info.outputs.tag }}
+          name: ${{ steps.release_info.outputs.name }}
+          body_path: release_body.md
+          draft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
+          prerelease: false
+          target_commitish: ${{ github.sha }}
+          files: release_files/*

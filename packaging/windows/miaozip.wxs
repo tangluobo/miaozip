@@ -31,7 +31,9 @@
             Icon="MiaoZipIcon"
             Advertise="no" />
         </File>
+        <File Id="ReadmeFile" Source="$(var.ReadmePath)" Name="README.md" />
         <File Id="LicenseFile" Source="$(var.LicensePath)" Name="LICENSE.txt" />
+        <File Id="NoticesFile" Source="$(var.NoticesPath)" Name="THIRD_PARTY_NOTICES.md" />
       </Component>
     </ComponentGroup>
 
