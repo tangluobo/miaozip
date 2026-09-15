@@ -83,7 +83,7 @@ Section: utils
 Priority: optional
 Architecture: $deb_arch
 Installed-Size: $installed_size
-Depends: libc6, libgcc-s1
+Depends: libc6 (>= 2.31), libgcc-s1, libstdc++6
 Recommends: xdg-desktop-portal | zenity
 Maintainer: MiaoZip Contributors <noreply@example.com>
 Homepage: https://github.com/tangluobo/miaozip

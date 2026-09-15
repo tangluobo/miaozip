@@ -75,6 +75,9 @@ cargo build --release
 | macOS | Intel x64 | `x86_64-apple-darwin` |
 | macOS | Apple Silicon ARM64 | `aarch64-apple-darwin` |
 
+Linux 发布包固定在 Ubuntu 20.04 容器中构建，并由 CI 校验最高 GLIBC
+需求不超过 2.31，兼容 Ubuntu 20.04、Debian 11 及更新发行版。
+
 每个架构的 Actions Artifact 都包含多种分发形式：
 
 | 系统 | 便携产物 | 安装产物 |
