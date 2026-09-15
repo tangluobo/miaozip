@@ -16,21 +16,31 @@
       <Directory Id="INSTALLFOLDER" Name="MiaoZip" />
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder">
-      <Directory Id="APPLICATIONPROGRAMSFOLDER" Name="妙压" />
+      <Directory Id="ApplicationProgramsFolder" Name="妙压">
+        <Component Id="StartMenuShortcutComponent" Guid="*">
+          <Shortcut
+            Id="StartMenuShortcut"
+            Name="妙压"
+            Description="妙压压缩文件管理器"
+            Target="[#MiaoZipExecutable]"
+            WorkingDirectory="INSTALLFOLDER"
+            Icon="MiaoZipIcon"
+            Advertise="no" />
+          <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
+          <RegistryValue
+            Root="HKCU"
+            Key="Software\MiaoZip"
+            Name="StartMenuShortcut"
+            Type="integer"
+            Value="1"
+            KeyPath="yes" />
+        </Component>
+      </Directory>
     </StandardDirectory>
 
     <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
       <Component Id="ApplicationFiles" Guid="*">
-        <File Id="MiaoZipExecutable" Source="$(var.BinaryPath)" Name="miaozip.exe" KeyPath="yes">
-          <Shortcut
-            Id="StartMenuShortcut"
-            Directory="APPLICATIONPROGRAMSFOLDER"
-            Name="妙压"
-            Description="妙压压缩文件管理器"
-            WorkingDirectory="INSTALLFOLDER"
-            Icon="MiaoZipIcon"
-            Advertise="no" />
-        </File>
+        <File Id="MiaoZipExecutable" Source="$(var.BinaryPath)" Name="miaozip.exe" KeyPath="yes" />
         <File Id="ReadmeFile" Source="$(var.ReadmePath)" Name="README.md" />
         <File Id="LicenseFile" Source="$(var.LicensePath)" Name="LICENSE.txt" />
         <File Id="NoticesFile" Source="$(var.NoticesPath)" Name="THIRD_PARTY_NOTICES.md" />
@@ -39,6 +49,7 @@
 
     <Feature Id="MainFeature" Title="妙压" Level="1">
       <ComponentGroupRef Id="ProductComponents" />
+      <ComponentRef Id="StartMenuShortcutComponent" />
     </Feature>
   </Package>
 </Wix>
