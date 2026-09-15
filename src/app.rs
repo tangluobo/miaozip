@@ -314,7 +314,11 @@ impl Default for MiaoZipApp {
             reveal_tree_selection: false,
             show_default_prompt: false,
             show_integration_dialog: false,
-            integration_dialog_tab: 0,
+            integration_dialog_tab: if cfg!(any(target_os = "linux", target_os = "macos")) {
+                1
+            } else {
+                0
+            },
             register_menu_with_default: true,
             dont_ask_again: false,
             integration_error: None,
@@ -396,13 +400,12 @@ impl MiaoZipApp {
         app.refresh_entries();
         match launch_action {
             LaunchAction::Normal => {
-                app.show_default_prompt = cfg!(windows)
-                    && should_show_registration_prompt(
-                        app.ask_default_on_startup,
-                        integration::default_candidate_registered(),
-                        integration::default_association_count(),
-                        integration::supported_association_extensions().count(),
-                    );
+                app.show_default_prompt = should_show_registration_prompt(
+                    app.ask_default_on_startup,
+                    integration::default_candidate_registered(),
+                    integration::default_association_count(),
+                    integration::supported_association_extensions().count(),
+                );
             }
             LaunchAction::Add(paths) | LaunchAction::AddContext(paths) => {
                 if paths.iter().all(|path| path.exists()) {
@@ -1857,9 +1860,11 @@ impl MiaoZipApp {
                 ui.add_space(6.0);
                 ui.group(|ui| {
                     ui.set_min_width(ui.available_width() - 12.0);
-                    ui.label("可为 ZIP、7z、RAR、TAR 等 13 种格式设置妙压图标和双击打开方式。若 Windows 已记录了某格式的用户选择，仍需在系统设置中手动切换。");
+                    ui.label("可为 ZIP、7z、RAR、TAR 等 13 种格式设置妙压图标和双击打开方式。部分系统可能要求你再次确认默认应用选择。");
                     ui.add_space(5.0);
-                    ui.checkbox(&mut self.register_menu_with_default, "同时注册文件与文件夹右键菜单");
+                    if cfg!(windows) {
+                        ui.checkbox(&mut self.register_menu_with_default, "同时注册文件与文件夹右键菜单");
+                    }
                     ui.checkbox(&mut self.dont_ask_again, "暂不注册时，以后也不再提示");
                 });
                 ui.add_space(10.0);
@@ -1875,7 +1880,7 @@ impl MiaoZipApp {
                     {
                         let result =
                             integration::set_default_associations().and_then(|remaining| {
-                                if self.register_menu_with_default {
+                                if cfg!(windows) && self.register_menu_with_default {
                                     integration::register_context_menu()?;
                                 }
                                 Ok(remaining)
@@ -1887,7 +1892,7 @@ impl MiaoZipApp {
                                     "已将支持的压缩格式设为妙压默认打开方式".to_owned()
                                 } else {
                                     format!(
-                                        "已完成可直接设置的关联；请在 Windows 设置中手动切换：{}",
+                                        "已完成可直接设置的关联；请在系统设置中手动切换：{}",
                                         remaining.join("、")
                                     )
                                 });
@@ -1904,7 +1909,7 @@ impl MiaoZipApp {
                     }
                     if ui.button("只注册，不改默认").clicked() {
                         let result = integration::register_default_candidate().and_then(|_| {
-                            if self.register_menu_with_default {
+                            if cfg!(windows) && self.register_menu_with_default {
                                 integration::register_context_menu()
                             } else {
                                 Ok(())
@@ -1934,7 +1939,15 @@ impl MiaoZipApp {
                 if let Some(error) = &self.integration_error {
                     ui.colored_label(egui::Color32::DARK_RED, error);
                 }
-                ui.weak("已由 Windows 记录用户选择的格式，需在“设置 → 关联”打开系统默认应用设置。");
+                if cfg!(windows) {
+                    ui.weak(
+                        "已由 Windows 记录用户选择的格式，需在“设置 → 关联”打开系统默认应用设置。",
+                    );
+                } else if cfg!(target_os = "linux") {
+                    ui.weak("通过 xdg-mime 设置当前用户的默认应用，不会修改其他用户的选择。");
+                } else if cfg!(target_os = "macos") {
+                    ui.weak("通过 macOS Launch Services 设置当前用户的默认打开方式。");
+                }
             },
         );
         if close {
@@ -1956,77 +1969,77 @@ impl MiaoZipApp {
             [600.0, 480.0],
             |ui, close| {
                 operation_heading(ui, "设置", "系统集成与文件关联");
-                if !cfg!(windows) {
-                    ui.label("此入口仅适用于 Windows；Linux 和 macOS 不会写入 Windows 注册表。");
-                    return;
-                }
                 operation_tabs(ui, &mut self.integration_dialog_tab, &["综合", "关联"]);
                 ui.add_space(10.0);
                 if self.integration_dialog_tab == 0 {
-                    ui.label(egui::RichText::new("资源管理器外壳整合").strong());
-                    ui.add_space(4.0);
-                    let registered = integration::context_menu_registered();
-                    integration_status_row(
-                        ui,
-                        "文件与文件夹右键菜单",
-                        if registered {
-                            "已注册"
-                        } else {
-                            "未注册或程序路径已变化"
-                        },
-                        registered,
-                    );
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new(if registered {
-                                        "重新注册右键菜单"
-                                    } else {
-                                        "注册 / 修复右键菜单"
-                                    })
-                                    .color(egui::Color32::WHITE),
+                    if !cfg!(windows) {
+                        ui.label("资源管理器右键菜单注册仅适用于 Windows；请切换到“关联”设置默认打开方式。");
+                    } else {
+                        ui.label(egui::RichText::new("资源管理器外壳整合").strong());
+                        ui.add_space(4.0);
+                        let registered = integration::context_menu_registered();
+                        integration_status_row(
+                            ui,
+                            "文件与文件夹右键菜单",
+                            if registered {
+                                "已注册"
+                            } else {
+                                "未注册或程序路径已变化"
+                            },
+                            registered,
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(if registered {
+                                            "重新注册右键菜单"
+                                        } else {
+                                            "注册 / 修复右键菜单"
+                                        })
+                                        .color(egui::Color32::WHITE),
+                                    )
+                                    .fill(BLUE),
                                 )
-                                .fill(BLUE),
-                            )
-                            .clicked()
-                        {
-                            match integration::register_context_menu() {
-                                Ok(()) => {
-                                    self.status =
-                                        JobStatus::Success("已注册妙压右键菜单".to_owned());
-                                    self.integration_error = None;
-                                }
-                                Err(error) => {
-                                    let message = format!("注册右键菜单失败：{error}");
-                                    self.integration_error = Some(message.clone());
-                                    self.status = JobStatus::Error(message);
-                                }
-                            }
-                        }
-                        if ui.button("移除右键菜单").clicked() {
-                            match integration::unregister_context_menu() {
-                                Ok(()) => {
-                                    self.status =
-                                        JobStatus::Success("已移除妙压右键菜单".to_owned());
-                                    self.integration_error = None;
-                                }
-                                Err(error) => {
-                                    let message = format!("移除右键菜单失败：{error}");
-                                    self.integration_error = Some(message.clone());
-                                    self.status = JobStatus::Error(message);
+                                .clicked()
+                            {
+                                match integration::register_context_menu() {
+                                    Ok(()) => {
+                                        self.status =
+                                            JobStatus::Success("已注册妙压右键菜单".to_owned());
+                                        self.integration_error = None;
+                                    }
+                                    Err(error) => {
+                                        let message = format!("注册右键菜单失败：{error}");
+                                        self.integration_error = Some(message.clone());
+                                        self.status = JobStatus::Error(message);
+                                    }
                                 }
                             }
-                        }
-                    });
-                    ui.add_space(12.0);
-                    ui.separator();
-                    ui.checkbox(
-                        &mut self.ask_default_on_startup,
-                        "未注册支持的压缩格式时在启动时提示",
-                    );
-                    ui.weak("Windows 11 中，经典右键菜单项通常位于“显示更多选项”。");
+                            if ui.button("移除右键菜单").clicked() {
+                                match integration::unregister_context_menu() {
+                                    Ok(()) => {
+                                        self.status =
+                                            JobStatus::Success("已移除妙压右键菜单".to_owned());
+                                        self.integration_error = None;
+                                    }
+                                    Err(error) => {
+                                        let message = format!("移除右键菜单失败：{error}");
+                                        self.integration_error = Some(message.clone());
+                                        self.status = JobStatus::Error(message);
+                                    }
+                                }
+                            }
+                        });
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.checkbox(
+                            &mut self.ask_default_on_startup,
+                            "未注册支持的压缩格式时在启动时提示",
+                        );
+                        ui.weak("Windows 11 中，经典右键菜单项通常位于“显示更多选项”。");
+                    }
                 } else {
                     ui.label(egui::RichText::new("压缩文件关联").strong());
                     ui.add_space(4.0);
@@ -2048,7 +2061,11 @@ impl MiaoZipApp {
                     let default_status = format!("已设默认 {default_count}/{supported_count} 种");
                     integration_status_row(
                         ui,
-                        "Windows 默认应用",
+                        if cfg!(windows) {
+                            "Windows 默认应用"
+                        } else {
+                            "系统默认应用"
+                        },
                         &default_status,
                         default_count == supported_count,
                     );
@@ -2102,7 +2119,8 @@ impl MiaoZipApp {
                                 }
                             }
                         }
-                        if ui.button("打开 Windows 默认应用设置").clicked() {
+                        if cfg!(windows) && ui.button("打开 Windows 默认应用设置").clicked()
+                        {
                             match integration::open_default_apps_settings() {
                                 Ok(()) => {
                                     self.status = JobStatus::Success(
@@ -2127,7 +2145,7 @@ impl MiaoZipApp {
                                     "全部支持格式已设为妙压默认打开方式".to_owned()
                                 } else {
                                     format!(
-                                        "已设置可直接更改的格式；请在 Windows 设置中手动切换：{}",
+                                        "已设置可直接更改的格式；请在系统设置中手动切换：{}",
                                         remaining.join("、")
                                     )
                                 });
@@ -2141,7 +2159,19 @@ impl MiaoZipApp {
                             }
                         }
                     }
-                    ui.weak("仅在没有 Windows UserChoice 的格式上直接设置；其余格式须在系统设置中确认。");
+                    if cfg!(windows) {
+                        ui.weak(
+                            "仅在没有 Windows UserChoice 的格式上直接设置；其余格式须在系统设置中确认。",
+                        );
+                    } else if cfg!(target_os = "linux") {
+                        ui.weak(
+                            "通过 xdg-mime 写入当前用户的默认应用设置，不会修改其他用户的选择。",
+                        );
+                    } else if cfg!(target_os = "macos") {
+                        ui.weak(
+                            "通过 macOS Launch Services 设置当前用户的默认打开方式；应用需从 MiaoZip.app 启动。",
+                        );
+                    }
                 }
                 if let Some(error) = &self.integration_error {
                     ui.add_space(5.0);

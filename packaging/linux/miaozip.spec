@@ -4,6 +4,7 @@ Release:        1%{?dist}
 Summary:        Cross-platform archive manager
 License:        MIT
 URL:            https://github.com/tangluobo/miaozip
+Requires:       xdg-utils
 Source0:        miaozip
 Source1:        miaozip.desktop
 Source2:        miaozip.png

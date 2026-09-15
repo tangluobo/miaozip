@@ -39,6 +39,8 @@
       </array>
       <key>CFBundleTypeName</key>
       <string>Archive</string>
+      <key>CFBundleTypeIconFile</key>
+      <string>miaozip.icns</string>
       <key>CFBundleTypeRole</key>
       <string>Viewer</string>
       <key>LSHandlerRank</key>

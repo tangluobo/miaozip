@@ -90,6 +90,22 @@ Linux 发布包固定在 Ubuntu 20.04 容器中构建，并由 CI 校验最高 G
 
 这些 CI 产物尚未进行商业代码签名或 Apple 公证，因此操作系统可能显示安全提醒。Windows 的 `.exe` 是图形化安装程序而非裸可执行文件；Linux 安装包包含桌面启动项和图标；macOS 的 ZIP、tar.gz、DMG 与 PKG 使用标准应用包结构。Linux 需要目标系统具备相应桌面和图形运行库；32 位 Linux 与 ARMv7 没有列入此矩阵，避免把尚未验证的 GUI 交叉编译目标标称为可用。
 
+Linux 安装后可在妙压的“系统集成 → 关联”中点击“将全部支持格式设为默认打开方式”，或执行：
+
+```bash
+miaozip --set-default-archives
+```
+
+妙压会通过 `xdg-mime` 设置当前用户的 ZIP、7z、RAR、TAR 及其压缩流格式关联。也可只设置单一格式，例如：`xdg-mime default miaozip.desktop application/zip`。
+
+macOS 请先将 `MiaoZip.app` 移入“应用程序”并至少启动一次，然后在妙压的“设置 → 关联”中点击“将全部支持格式设为默认打开方式”，或执行：
+
+```bash
+/Applications/MiaoZip.app/Contents/MacOS/miaozip --set-default-archives
+```
+
+妙压会通过 Launch Services 设置当前用户的文件关联，不需要 `sudo`，也不会在未获用户操作时替换现有默认应用。
+
 ## 各平台准备
 
 ### Windows

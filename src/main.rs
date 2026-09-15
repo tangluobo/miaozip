@@ -25,6 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let launch_action = match integration::LaunchAction::from_env() {
         integration::LaunchAction::RegisterIntegration => {
             integration::register_default_candidate()?;
+            #[cfg(windows)]
             integration::register_context_menu()?;
             return Ok(());
         }
@@ -32,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let remaining = integration::set_default_associations()?;
             if !remaining.is_empty() {
                 return Err(format!(
-                    "以下格式需要在 Windows 默认应用设置中手动选择妙压：{}",
+                    "以下格式仍需在系统默认应用设置中手动选择妙压：{}",
                     remaining.join("、")
                 )
                 .into());

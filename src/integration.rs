@@ -964,12 +964,558 @@ mod platform {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+mod platform {
+    use super::*;
+    use std::env;
+    use std::fs;
+    use std::path::Path;
+    use std::process::{Command, Output};
+
+    const DESKTOP_ID: &str = "miaozip.desktop";
+    const ICON_PNG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/miaozip-icon.png"));
+    const MIME_TYPES: &[&str] = &[
+        "application/zip",
+        "application/x-zip",
+        "application/x-zip-compressed",
+        "application/x-7z-compressed",
+        "application/vnd.rar",
+        "application/x-rar",
+        "application/x-rar-compressed",
+        "application/x-tar",
+        "application/gzip",
+        "application/x-gzip",
+        "application/x-compressed-tar",
+        "application/x-bzip2",
+        "application/bzip2",
+        "application/x-bzip",
+        "application/x-bzip2-compressed-tar",
+        "application/x-bzip-compressed-tar",
+        "application/x-xz",
+        "application/x-xz-compressed-tar",
+        "application/zstd",
+        "application/x-zstd",
+        "application/x-zstd-compressed-tar",
+    ];
+
+    fn canonical_mime(extension: &str) -> &'static str {
+        match extension {
+            ".zip" => "application/zip",
+            ".7z" => "application/x-7z-compressed",
+            ".rar" => "application/vnd.rar",
+            ".tar" => "application/x-tar",
+            ".gz" => "application/gzip",
+            ".bz2" => "application/x-bzip2",
+            ".xz" => "application/x-xz",
+            ".zst" => "application/zstd",
+            ".tgz" => "application/x-compressed-tar",
+            ".tbz" | ".tbz2" => "application/x-bzip2-compressed-tar",
+            ".txz" => "application/x-xz-compressed-tar",
+            ".tzst" => "application/x-zstd-compressed-tar",
+            _ => "application/octet-stream",
+        }
+    }
+
+    fn data_home() -> io::Result<PathBuf> {
+        if let Some(path) = env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+            return Ok(PathBuf::from(path));
+        }
+        let home = env::var_os("HOME").ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "无法确定用户目录：HOME 和 XDG_DATA_HOME 均未设置",
+            )
+        })?;
+        Ok(PathBuf::from(home).join(".local/share"))
+    }
+
+    fn current_launcher() -> io::Result<PathBuf> {
+        if let Some(path) = env::var_os("APPIMAGE").map(PathBuf::from)
+            && path.is_file()
+        {
+            return Ok(path);
+        }
+        env::current_exe()
+    }
+
+    fn quote_desktop_exec(path: &Path) -> String {
+        let mut escaped = String::new();
+        for character in path.to_string_lossy().chars() {
+            match character {
+                '\\' => escaped.push_str("\\\\"),
+                '"' => escaped.push_str("\\\""),
+                '`' => escaped.push_str("\\`"),
+                '$' => escaped.push_str("\\$"),
+                character => escaped.push(character),
+            }
+        }
+        format!("\"{escaped}\"")
+    }
+
+    fn user_desktop_path() -> io::Result<PathBuf> {
+        Ok(data_home()?.join("applications").join(DESKTOP_ID))
+    }
+
+    fn system_candidate_exists() -> bool {
+        [
+            Path::new("/usr/share/applications/miaozip.desktop"),
+            Path::new("/usr/local/share/applications/miaozip.desktop"),
+        ]
+        .into_iter()
+        .any(Path::is_file)
+    }
+
+    fn run_xdg_mime(arguments: &[&str]) -> io::Result<Output> {
+        Command::new("xdg-mime")
+            .args(arguments)
+            .output()
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "未找到 xdg-mime，请安装 xdg-utils 后重试",
+                    )
+                } else {
+                    error
+                }
+            })
+    }
+
+    fn query_default(mime_type: &str) -> bool {
+        run_xdg_mime(&["query", "default", mime_type])
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .is_some_and(|desktop| desktop.trim() == DESKTOP_ID)
+    }
+
+    fn unsupported_context_menu() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Linux 文件管理器没有统一的右键菜单注册接口",
+        )
+    }
+
+    pub fn register_default_candidate() -> io::Result<()> {
+        if system_candidate_exists() {
+            return Ok(());
+        }
+
+        let data = data_home()?;
+        let applications = data.join("applications");
+        let icons = data.join("icons/hicolor/256x256/apps");
+        fs::create_dir_all(&applications)?;
+        fs::create_dir_all(&icons)?;
+        fs::write(icons.join("miaozip.png"), ICON_PNG)?;
+
+        let mime_types = MIME_TYPES.join(";");
+        let launcher = quote_desktop_exec(&current_launcher()?);
+        let desktop = format!(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=妙压\n\
+             GenericName=Archive Manager\n\
+             Comment=Create, browse and extract archive files\n\
+             Exec={launcher} %f\n\
+             Icon=miaozip\n\
+             Terminal=false\n\
+             Categories=Utility;Archiving;\n\
+             MimeType={mime_types};\n\
+             StartupNotify=true\n"
+        );
+        fs::write(applications.join(DESKTOP_ID), desktop)?;
+
+        match Command::new("update-desktop-database")
+            .arg(&applications)
+            .output()
+        {
+            Ok(output) if !output.status.success() => Err(io::Error::other(format!(
+                "更新桌面应用数据库失败：{}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))),
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn set_default_associations() -> io::Result<Vec<&'static str>> {
+        register_default_candidate()?;
+        for mime_type in MIME_TYPES {
+            let output = run_xdg_mime(&["default", DESKTOP_ID, mime_type])?;
+            if !output.status.success() {
+                return Err(io::Error::other(format!(
+                    "无法设置 {mime_type} 的默认应用：{}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+        }
+        Ok(supported_association_extensions()
+            .filter(|extension| !query_default(canonical_mime(extension)))
+            .collect())
+    }
+
+    pub fn is_default_zip() -> bool {
+        query_default("application/zip")
+    }
+
+    pub fn default_association_count() -> usize {
+        supported_association_extensions()
+            .filter(|extension| query_default(canonical_mime(extension)))
+            .count()
+    }
+
+    pub fn default_candidate_registered() -> bool {
+        system_candidate_exists() || user_desktop_path().is_ok_and(|path| path.is_file())
+    }
+
+    pub fn open_default_apps_settings() -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Linux 桌面环境没有统一的默认应用设置页面，请使用妙压的“设为默认”按钮",
+        ))
+    }
+
+    pub fn register_context_menu() -> io::Result<()> {
+        Err(unsupported_context_menu())
+    }
+
+    pub fn collect_context_selection(paths: Vec<PathBuf>) -> Option<Vec<PathBuf>> {
+        Some(paths)
+    }
+
+    pub fn context_menu_registered() -> bool {
+        false
+    }
+
+    pub fn unregister_context_menu() -> io::Result<()> {
+        Err(unsupported_context_menu())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn every_linux_association_has_a_known_mime_type() {
+            for extension in supported_association_extensions() {
+                assert_ne!(canonical_mime(extension), "application/octet-stream");
+            }
+        }
+
+        #[test]
+        fn packaged_desktop_entry_declares_every_mime_type() {
+            let desktop = include_str!("../packaging/linux/miaozip.desktop");
+            for mime_type in MIME_TYPES {
+                assert!(
+                    desktop.contains(&format!("{mime_type};")),
+                    "desktop entry is missing {mime_type}"
+                );
+            }
+        }
+
+        #[test]
+        fn desktop_exec_path_is_quoted_and_escaped() {
+            assert_eq!(
+                quote_desktop_exec(Path::new("/tmp/Miao Zip/$current")),
+                "\"/tmp/Miao Zip/\\$current\""
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod platform {
+    use super::*;
+    use std::ffi::{CString, c_char, c_void};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+    use std::ptr;
+
+    type CfTypeRef = *const c_void;
+    type CfStringRef = *const c_void;
+    type CfUrlRef = *const c_void;
+    type OsStatus = i32;
+    type LsRolesMask = u32;
+
+    const BUNDLE_IDENTIFIER: &str = "com.tangluobo.miaozip";
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+    const K_LS_ROLES_VIEWER: LsRolesMask = 0x0000_0002;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringCreateWithCString(
+            allocator: *const c_void,
+            string: *const c_char,
+            encoding: u32,
+        ) -> CfStringRef;
+        fn CFURLCreateFromFileSystemRepresentation(
+            allocator: *const c_void,
+            buffer: *const u8,
+            buffer_length: isize,
+            is_directory: u8,
+        ) -> CfUrlRef;
+        fn CFEqual(first: CfTypeRef, second: CfTypeRef) -> u8;
+        fn CFRelease(value: CfTypeRef);
+    }
+
+    #[link(name = "CoreServices", kind = "framework")]
+    unsafe extern "C" {
+        static kUTTagClassFilenameExtension: CfStringRef;
+
+        fn LSRegisterURL(url: CfUrlRef, update: u8) -> OsStatus;
+        fn LSSetDefaultRoleHandlerForContentType(
+            content_type: CfStringRef,
+            role: LsRolesMask,
+            handler_bundle_identifier: CfStringRef,
+        ) -> OsStatus;
+        fn LSCopyDefaultRoleHandlerForContentType(
+            content_type: CfStringRef,
+            role: LsRolesMask,
+        ) -> CfStringRef;
+        fn UTTypeCreatePreferredIdentifierForTag(
+            tag_class: CfStringRef,
+            tag: CfStringRef,
+            conforming_to_type: CfStringRef,
+        ) -> CfStringRef;
+    }
+
+    struct OwnedCf(CfTypeRef);
+
+    impl OwnedCf {
+        fn string(value: &str) -> io::Result<Self> {
+            let value = CString::new(value)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "字符串中包含空字符"))?;
+            // SAFETY: `value` is a live, NUL-terminated UTF-8 CString for the duration
+            // of this call. Core Foundation returns an owned reference.
+            let reference = unsafe {
+                CFStringCreateWithCString(ptr::null(), value.as_ptr(), K_CF_STRING_ENCODING_UTF8)
+            };
+            Self::from_created(reference, "无法创建 macOS 文件关联字符串")
+        }
+
+        fn from_created(reference: CfTypeRef, message: &str) -> io::Result<Self> {
+            if reference.is_null() {
+                Err(io::Error::other(message))
+            } else {
+                Ok(Self(reference))
+            }
+        }
+    }
+
+    impl Drop for OwnedCf {
+        fn drop(&mut self) {
+            // SAFETY: OwnedCf only wraps references returned with create/copy
+            // ownership and releases each reference exactly once.
+            unsafe { CFRelease(self.0) };
+        }
+    }
+
+    fn app_bundle_from_executable(executable: &Path) -> Option<PathBuf> {
+        let macos = executable.parent()?;
+        if macos.file_name()? != "MacOS" {
+            return None;
+        }
+        let contents = macos.parent()?;
+        if contents.file_name()? != "Contents" {
+            return None;
+        }
+        let bundle = contents.parent()?;
+        bundle
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
+            .then(|| bundle.to_path_buf())
+    }
+
+    fn current_app_bundle() -> io::Result<PathBuf> {
+        let executable = std::env::current_exe()?;
+        let bundle = app_bundle_from_executable(&executable).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "macOS 文件关联要求从 MiaoZip.app 启动；请将应用移入“应用程序”后重新打开",
+            )
+        })?;
+        if !bundle.join("Contents/Info.plist").is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "MiaoZip.app 缺少 Contents/Info.plist，无法注册文件类型",
+            ));
+        }
+        Ok(bundle)
+    }
+
+    fn extension_uti(extension: &str) -> io::Result<OwnedCf> {
+        let extension = OwnedCf::string(extension.trim_start_matches('.'))?;
+        // SAFETY: Both CFString references are valid for the call. Passing null for
+        // `conforming_to_type` asks Launch Services for the preferred UTI.
+        let uti = unsafe {
+            UTTypeCreatePreferredIdentifierForTag(
+                kUTTagClassFilenameExtension,
+                extension.0,
+                ptr::null(),
+            )
+        };
+        OwnedCf::from_created(uti, "macOS 无法识别该文件扩展名")
+    }
+
+    fn is_default(extension: &str) -> bool {
+        let Ok(uti) = extension_uti(extension) else {
+            return false;
+        };
+        let Ok(bundle_identifier) = OwnedCf::string(BUNDLE_IDENTIFIER) else {
+            return false;
+        };
+        // SAFETY: `uti` is a valid CFString. The Copy rule transfers ownership
+        // of the returned handler to this function.
+        let handler = unsafe { LSCopyDefaultRoleHandlerForContentType(uti.0, K_LS_ROLES_VIEWER) };
+        let Ok(handler) = OwnedCf::from_created(handler, "没有默认处理程序") else {
+            return false;
+        };
+        // SAFETY: Both values are valid Core Foundation strings.
+        unsafe { CFEqual(handler.0, bundle_identifier.0) != 0 }
+    }
+
+    fn launch_services_error(action: &str, status: OsStatus) -> io::Error {
+        io::Error::other(format!("{action}失败（Launch Services 状态码 {status}）"))
+    }
+
+    pub fn register_default_candidate() -> io::Result<()> {
+        let bundle = current_app_bundle()?;
+        let bytes = bundle.as_os_str().as_bytes();
+        // SAFETY: The byte slice remains live during the call and represents a
+        // local filesystem path. The returned URL follows the Create rule.
+        let url = unsafe {
+            CFURLCreateFromFileSystemRepresentation(
+                ptr::null(),
+                bytes.as_ptr(),
+                bytes.len() as isize,
+                1,
+            )
+        };
+        let url = OwnedCf::from_created(url, "无法创建 MiaoZip.app 的文件 URL")?;
+        // SAFETY: `url` is a valid file URL pointing at the application bundle.
+        let status = unsafe { LSRegisterURL(url.0, 1) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(launch_services_error("注册 MiaoZip.app", status))
+        }
+    }
+
+    pub fn set_default_associations() -> io::Result<Vec<&'static str>> {
+        register_default_candidate()?;
+        let bundle_identifier = OwnedCf::string(BUNDLE_IDENTIFIER)?;
+        let mut first_error = None;
+
+        for extension in supported_association_extensions() {
+            let uti = extension_uti(extension)?;
+            // SAFETY: `uti` and `bundle_identifier` are valid CFStrings and the
+            // requested Viewer role matches the declaration in Info.plist.
+            let status = unsafe {
+                LSSetDefaultRoleHandlerForContentType(uti.0, K_LS_ROLES_VIEWER, bundle_identifier.0)
+            };
+            if status != 0 && first_error.is_none() {
+                first_error = Some((extension, status));
+            }
+        }
+
+        let remaining: Vec<_> = supported_association_extensions()
+            .filter(|extension| !is_default(extension))
+            .collect();
+        if remaining.len() == FILE_ASSOCIATIONS.len()
+            && let Some((extension, status)) = first_error
+        {
+            return Err(launch_services_error(
+                &format!("设置 {extension} 的默认打开方式"),
+                status,
+            ));
+        }
+        Ok(remaining)
+    }
+
+    pub fn is_default_zip() -> bool {
+        is_default(".zip")
+    }
+
+    pub fn default_association_count() -> usize {
+        supported_association_extensions()
+            .filter(|extension| is_default(extension))
+            .count()
+    }
+
+    pub fn default_candidate_registered() -> bool {
+        current_app_bundle().is_ok()
+    }
+
+    pub fn open_default_apps_settings() -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "macOS 没有统一的压缩文件默认应用设置页，请使用妙压的“设为默认”按钮",
+        ))
+    }
+
+    fn unsupported_context_menu() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "macOS Finder 没有与 Windows 注册表右键菜单相同的注册接口",
+        )
+    }
+
+    pub fn register_context_menu() -> io::Result<()> {
+        Err(unsupported_context_menu())
+    }
+
+    pub fn collect_context_selection(paths: Vec<PathBuf>) -> Option<Vec<PathBuf>> {
+        Some(paths)
+    }
+
+    pub fn context_menu_registered() -> bool {
+        false
+    }
+
+    pub fn unregister_context_menu() -> io::Result<()> {
+        Err(unsupported_context_menu())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn locates_bundle_from_packaged_executable() {
+            assert_eq!(
+                app_bundle_from_executable(Path::new(
+                    "/Applications/MiaoZip.app/Contents/MacOS/miaozip"
+                )),
+                Some(PathBuf::from("/Applications/MiaoZip.app"))
+            );
+            assert_eq!(
+                app_bundle_from_executable(Path::new("/usr/bin/miaozip")),
+                None
+            );
+        }
+
+        #[test]
+        fn packaged_plist_declares_every_archive_extension() {
+            let plist = include_str!("../packaging/macos/Info.plist");
+            for extension in supported_association_extensions() {
+                let extension = extension.trim_start_matches('.');
+                assert!(
+                    plist.contains(&format!("<string>{extension}</string>")),
+                    "Info.plist is missing {extension}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod platform {
     use super::*;
 
     fn unsupported() -> io::Error {
-        io::Error::new(io::ErrorKind::Unsupported, "此系统集成入口仅适用于 Windows")
+        io::Error::new(io::ErrorKind::Unsupported, "此系统不支持该系统集成功能")
     }
 
     pub fn register_default_candidate() -> io::Result<()> {
