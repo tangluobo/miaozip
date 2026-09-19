@@ -1,18 +1,21 @@
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
-use zip::write::SimpleFileOptions;
-use zip::{CompressionMethod, ZipArchive, ZipWriter};
+use zip::write::{FileOptions, SimpleFileOptions};
+use zip::{AesMode, CompressionMethod, ZipArchive, ZipWriter};
+
+const SFX_TRAILER_MAGIC: &[u8; 8] = b"MZSFX001";
+const SFX_TRAILER_SIZE: u64 = 16;
 
 mod preview;
 #[cfg(all(windows, target_arch = "x86"))]
 mod rar_win32;
-pub use preview::extract_entry_for_open;
+pub use preview::extract_entry_for_open_with_password;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ArchiveFormat {
@@ -125,10 +128,11 @@ pub struct ArchiveListEntry {
     pub path: String,
     pub is_directory: bool,
     pub size: Option<u64>,
+    pub encrypted: bool,
 }
 
 impl ArchiveListEntry {
-    fn new(name: &str, is_directory: bool, size: Option<u64>) -> Result<Self> {
+    fn new(name: &str, is_directory: bool, size: Option<u64>, encrypted: bool) -> Result<Self> {
         let safe = safe_archive_name(name)?;
         Ok(Self {
             path: safe
@@ -138,6 +142,7 @@ impl ArchiveListEntry {
                 .join("/"),
             is_directory,
             size: if is_directory { None } else { size },
+            encrypted,
         })
     }
 }
@@ -152,11 +157,14 @@ pub fn list_archive_entries(archive_path: &Path) -> Result<Vec<ArchiveListEntry>
             let mut archive =
                 ZipArchive::new(File::open(archive_path)?).context("文件不是有效的 ZIP 压缩包")?;
             for index in 0..archive.len() {
-                let entry = archive.by_index(index).context("无法读取 ZIP 文件目录")?;
+                let entry = archive
+                    .by_index_raw(index)
+                    .context("无法读取 ZIP 文件目录")?;
                 result.push(ArchiveListEntry::new(
                     entry.name(),
                     entry.is_dir(),
                     Some(entry.size()),
+                    entry.encrypted(),
                 )?);
             }
         }
@@ -169,6 +177,7 @@ pub fn list_archive_entries(archive_path: &Path) -> Result<Vec<ArchiveListEntry>
                     &entry.name,
                     entry.is_directory,
                     Some(entry.size),
+                    false,
                 )?);
             }
         }
@@ -184,6 +193,7 @@ pub fn list_archive_entries(archive_path: &Path) -> Result<Vec<ArchiveListEntry>
                         &entry.filename.to_string_lossy(),
                         entry.is_directory(),
                         Some(entry.unpacked_size),
+                        false,
                     )?);
                 }
             }
@@ -196,6 +206,7 @@ pub fn list_archive_entries(archive_path: &Path) -> Result<Vec<ArchiveListEntry>
                         &entry.name,
                         entry.is_directory,
                         Some(entry.unpacked_size),
+                        false,
                     )?);
                     archive.skip()?;
                 }
@@ -212,7 +223,7 @@ pub fn list_archive_entries(archive_path: &Path) -> Result<Vec<ArchiveListEntry>
                 .filter(|_| filename.to_ascii_lowercase().ends_with(suffix))
                 .filter(|name| !name.is_empty())
                 .ok_or_else(|| anyhow!("无效的单文件压缩格式"))?;
-            result.push(ArchiveListEntry::new(output_name, false, None)?);
+            result.push(ArchiveListEntry::new(output_name, false, None, false)?);
         }
         _ => {
             let mut archive = tar::Archive::new(tar_input(archive_path, format)?);
@@ -222,6 +233,7 @@ pub fn list_archive_entries(archive_path: &Path) -> Result<Vec<ArchiveListEntry>
                     &entry.path()?.to_string_lossy(),
                     entry.header().entry_type().is_dir(),
                     Some(entry.header().size()?),
+                    false,
                 )?);
             }
         }
@@ -236,11 +248,30 @@ struct ArchiveEntry {
     is_directory: bool,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn create_archive(
     inputs: &[PathBuf],
     destination: &Path,
     format: ArchiveFormat,
     compression_level: u8,
+    on_progress: impl FnMut(Progress),
+) -> Result<OperationSummary> {
+    create_archive_with_password(
+        inputs,
+        destination,
+        format,
+        compression_level,
+        None,
+        on_progress,
+    )
+}
+
+pub fn create_archive_with_password(
+    inputs: &[PathBuf],
+    destination: &Path,
+    format: ArchiveFormat,
+    compression_level: u8,
+    password: Option<&str>,
     on_progress: impl FnMut(Progress),
 ) -> Result<OperationSummary> {
     if format
@@ -252,10 +283,20 @@ pub fn create_archive(
             format.extension()
         );
     }
+    if password.is_some_and(str::is_empty) {
+        bail!("ZIP 密码不能为空");
+    }
+    if password.is_some() && format != ArchiveFormat::Zip {
+        bail!("当前仅支持为 ZIP 压缩包设置 AES-256 密码");
+    }
     match format {
-        ArchiveFormat::Zip => {
-            create_zip_archive(inputs, destination, compression_level, on_progress)
-        }
+        ArchiveFormat::Zip => create_zip_archive(
+            inputs,
+            destination,
+            compression_level,
+            password,
+            on_progress,
+        ),
         ArchiveFormat::SevenZip => create_7z_archive(inputs, destination, on_progress),
         ArchiveFormat::Rar => bail!("RAR 目前仅支持解压，不能创建 RAR 压缩包"),
         ArchiveFormat::Gzip | ArchiveFormat::Bzip2 | ArchiveFormat::Xz | ArchiveFormat::Zstd => {
@@ -269,6 +310,7 @@ fn create_zip_archive(
     inputs: &[PathBuf],
     destination: &Path,
     compression_level: u8,
+    password: Option<&str>,
     mut on_progress: impl FnMut(Progress),
 ) -> Result<OperationSummary> {
     if inputs.is_empty() {
@@ -290,14 +332,6 @@ fn create_zip_archive(
     let output = File::create(destination)
         .with_context(|| format!("无法创建压缩包：{}", destination.display()))?;
     let mut writer = ZipWriter::new(output);
-    let file_options = if compression_level == 0 {
-        SimpleFileOptions::default().compression_method(CompressionMethod::Stored)
-    } else {
-        SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Deflated)
-            .compression_level(Some(i64::from(compression_level)))
-    }
-    .unix_permissions(0o644);
     let directory_options = SimpleFileOptions::default().unix_permissions(0o755);
     let mut summary = OperationSummary::default();
 
@@ -316,6 +350,7 @@ fn create_zip_archive(
                     .with_context(|| format!("无法写入目录：{}", entry.name))?;
                 summary.directories += 1;
             } else {
+                let file_options = zip_file_options(compression_level, password);
                 writer
                     .start_file(&entry.name, file_options)
                     .with_context(|| format!("无法写入文件头：{}", entry.name))?;
@@ -346,13 +381,350 @@ fn create_zip_archive(
     Ok(summary)
 }
 
+fn zip_file_options<'a>(compression_level: u8, password: Option<&'a str>) -> FileOptions<'a, ()> {
+    let options = if compression_level == 0 {
+        SimpleFileOptions::default().compression_method(CompressionMethod::Stored)
+    } else {
+        SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .compression_level(Some(i64::from(compression_level)))
+    }
+    .unix_permissions(0o644);
+    match password {
+        Some(password) => options.with_aes_encryption(AesMode::Aes256, password),
+        None => options,
+    }
+}
+
+fn archive_name_with_prefix(prefix: &str, name: &str) -> String {
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{prefix}/{}", name.trim_start_matches('/'))
+    }
+}
+
+fn matches_removed_entry(name: &str, removed: &HashSet<String>) -> bool {
+    let name = name.trim_end_matches('/');
+    removed.iter().any(|candidate| {
+        let candidate = candidate.trim_matches('/');
+        name == candidate || name.starts_with(&format!("{candidate}/"))
+    })
+}
+
+fn replace_archive_file(archive_path: &Path, replacement: PathBuf) -> Result<()> {
+    let parent = archive_path.parent().unwrap_or_else(|| Path::new("."));
+    let backup = tempfile::Builder::new()
+        .prefix(".miaozip-backup-")
+        .tempfile_in(parent)?;
+    let backup_path = backup.path().to_path_buf();
+    backup.close()?;
+    if let Err(error) = fs::rename(archive_path, &backup_path) {
+        let _ = fs::remove_file(&replacement);
+        return Err(error).with_context(|| format!("无法备份原压缩包：{}", archive_path.display()));
+    }
+    if let Err(error) = fs::rename(&replacement, archive_path) {
+        let _ = fs::rename(&backup_path, archive_path);
+        let _ = fs::remove_file(&replacement);
+        return Err(error).with_context(|| format!("无法替换压缩包：{}", archive_path.display()));
+    }
+    fs::remove_file(&backup_path).with_context(|| "新压缩包已写入，但无法删除临时备份")?;
+    Ok(())
+}
+
+/// Rewrites a ZIP through a same-directory temporary file. Existing compressed
+/// bytes (including encrypted entries) are copied unchanged unless replaced.
+pub fn update_zip_archive(
+    archive_path: &Path,
+    additions: &[PathBuf],
+    removed: &HashSet<String>,
+    target_prefix: &str,
+    compression_level: u8,
+    password_for_new_files: Option<&str>,
+    mut on_progress: impl FnMut(Progress),
+) -> Result<OperationSummary> {
+    if ArchiveFormat::from_path(archive_path) != Some(ArchiveFormat::Zip) {
+        bail!("目前仅支持编辑 ZIP 压缩包");
+    }
+    if additions.is_empty() && removed.is_empty() {
+        bail!("没有需要写入的更改");
+    }
+    let additions = collect_entries(additions, archive_path)?;
+    let added_names: HashSet<String> = additions
+        .iter()
+        .map(|entry| archive_name_with_prefix(target_prefix, &entry.name))
+        .collect();
+    let parent = archive_path.parent().unwrap_or_else(|| Path::new("."));
+    let temporary = tempfile::Builder::new()
+        .prefix(".miaozip-update-")
+        .suffix(".zip")
+        .tempfile_in(parent)?;
+    let output = temporary.reopen()?;
+    let input = File::open(archive_path)
+        .with_context(|| format!("无法打开压缩包：{}", archive_path.display()))?;
+    let mut source = ZipArchive::new(input).context("文件不是有效的 ZIP 压缩包")?;
+    let original_total = source.len();
+    let total = original_total + additions.len();
+    let mut writer = ZipWriter::new(output);
+    let mut summary = OperationSummary::default();
+    let mut copied_names = HashSet::new();
+
+    for index in 0..original_total {
+        let entry = source.by_index_raw(index)?;
+        let name = entry.name().to_owned();
+        on_progress(Progress {
+            completed: index,
+            total,
+            current: name.clone(),
+        });
+        if matches_removed_entry(&name, removed)
+            || added_names.contains(name.trim_end_matches('/'))
+            || !copied_names.insert(name.clone())
+        {
+            continue;
+        }
+        writer
+            .raw_copy_file(entry)
+            .with_context(|| format!("无法保留压缩包条目：{name}"))?;
+    }
+
+    let directory_options = SimpleFileOptions::default().unix_permissions(0o755);
+    for (offset, entry) in additions.iter().enumerate() {
+        let name = archive_name_with_prefix(target_prefix, &entry.name);
+        on_progress(Progress {
+            completed: original_total + offset,
+            total,
+            current: name.clone(),
+        });
+        if entry.is_directory {
+            writer.add_directory(
+                format!("{}/", name.trim_end_matches('/')),
+                directory_options,
+            )?;
+            summary.directories += 1;
+        } else {
+            writer.start_file(
+                &name,
+                zip_file_options(compression_level, password_for_new_files),
+            )?;
+            let mut input = File::open(&entry.source)
+                .with_context(|| format!("无法读取文件：{}", entry.source.display()))?;
+            summary.bytes += io::copy(&mut input, &mut writer)?;
+            summary.files += 1;
+        }
+    }
+    let output = writer.finish()?;
+    output.sync_all()?;
+    drop(source);
+    let (temporary_file, temporary_path) = temporary.keep()?;
+    drop(temporary_file);
+    replace_archive_file(archive_path, temporary_path)?;
+    on_progress(Progress {
+        completed: total,
+        total,
+        current: archive_path.display().to_string(),
+    });
+    Ok(summary)
+}
+
+pub fn validate_zip_password(archive_path: &Path, password: &str) -> Result<()> {
+    if password.is_empty() {
+        bail!("密码不能为空");
+    }
+    let mut archive = ZipArchive::new(File::open(archive_path)?)?;
+    for index in 0..archive.len() {
+        if archive.by_index_raw(index)?.encrypted() {
+            let mut entry = archive
+                .by_index_decrypt(index, password.as_bytes())
+                .context("密码错误或压缩包已损坏")?;
+            io::copy(&mut entry, &mut io::sink()).context("密码错误或压缩包已损坏")?;
+            return Ok(());
+        }
+    }
+    bail!("该 ZIP 没有加密文件")
+}
+
+pub fn rewrite_zip_password(
+    archive_path: &Path,
+    old_password: Option<&str>,
+    new_password: Option<&str>,
+    mut on_progress: impl FnMut(Progress),
+) -> Result<OperationSummary> {
+    if ArchiveFormat::from_path(archive_path) != Some(ArchiveFormat::Zip) {
+        bail!("目前仅支持修改 ZIP 密码");
+    }
+    if new_password.is_some_and(str::is_empty) {
+        bail!("新密码不能为空");
+    }
+    let parent = archive_path.parent().unwrap_or_else(|| Path::new("."));
+    let temporary = tempfile::Builder::new()
+        .prefix(".miaozip-password-")
+        .suffix(".zip")
+        .tempfile_in(parent)?;
+    let output = temporary.reopen()?;
+    let mut source = ZipArchive::new(File::open(archive_path)?)?;
+    let total = source.len();
+    let mut writer = ZipWriter::new(output);
+    let mut summary = OperationSummary::default();
+
+    for index in 0..total {
+        let encrypted = source.by_index_raw(index)?.encrypted();
+        let mut entry = if encrypted {
+            let password = old_password
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("原 ZIP 已加密，请输入当前密码"))?;
+            source
+                .by_index_decrypt(index, password.as_bytes())
+                .context("当前密码错误或压缩包已损坏")?
+        } else {
+            source.by_index(index)?
+        };
+        let name = entry.name().to_owned();
+        on_progress(Progress {
+            completed: index,
+            total,
+            current: name.clone(),
+        });
+        if entry.is_dir() {
+            writer.add_directory(
+                format!("{}/", name.trim_end_matches('/')),
+                SimpleFileOptions::default().unix_permissions(0o755),
+            )?;
+            summary.directories += 1;
+        } else {
+            let method = entry.compression();
+            let mut options = SimpleFileOptions::default()
+                .compression_method(method)
+                .unix_permissions(0o644);
+            if let Some(password) = new_password {
+                options = options.with_aes_encryption(AesMode::Aes256, password);
+            }
+            writer.start_file(&name, options)?;
+            summary.bytes += io::copy(&mut entry, &mut writer)
+                .with_context(|| format!("无法读取 ZIP 条目：{name}"))?;
+            summary.files += 1;
+        }
+    }
+    let output = writer.finish()?;
+    output.sync_all()?;
+    drop(source);
+    let (temporary_file, temporary_path) = temporary.keep()?;
+    drop(temporary_file);
+    replace_archive_file(archive_path, temporary_path)?;
+    on_progress(Progress {
+        completed: total,
+        total,
+        current: archive_path.display().to_string(),
+    });
+    Ok(summary)
+}
+
+fn sfx_payload_range(path: &Path) -> Result<Option<(u64, u64)>> {
+    let mut input = File::open(path)?;
+    let length = input.metadata()?.len();
+    if length < SFX_TRAILER_SIZE {
+        return Ok(None);
+    }
+    input.seek(SeekFrom::End(-(SFX_TRAILER_SIZE as i64)))?;
+    let mut magic = [0; 8];
+    input.read_exact(&mut magic)?;
+    if &magic != SFX_TRAILER_MAGIC {
+        return Ok(None);
+    }
+    let mut offset = [0; 8];
+    input.read_exact(&mut offset)?;
+    let offset = u64::from_le_bytes(offset);
+    let payload_length = length.saturating_sub(SFX_TRAILER_SIZE + offset);
+    if offset == 0 || payload_length == 0 || offset >= length - SFX_TRAILER_SIZE {
+        bail!("自解压文件尾部数据无效");
+    }
+    Ok(Some((offset, payload_length)))
+}
+
+pub fn is_self_extracting(path: &Path) -> bool {
+    sfx_payload_range(path).ok().flatten().is_some()
+}
+
+pub fn create_self_extracting(
+    stub_executable: &Path,
+    zip_path: &Path,
+    output: &Path,
+) -> Result<OperationSummary> {
+    if ArchiveFormat::from_path(zip_path) != Some(ArchiveFormat::Zip) {
+        bail!("自解压文件目前只支持 ZIP");
+    }
+    ZipArchive::new(File::open(zip_path)?).context("文件不是有效的 ZIP 压缩包")?;
+    if output == stub_executable || output == zip_path {
+        bail!("自解压输出不能覆盖程序或原 ZIP");
+    }
+    let stub_length = sfx_payload_range(stub_executable)?
+        .map(|(offset, _)| offset)
+        .unwrap_or(fs::metadata(stub_executable)?.len());
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let stub = File::open(stub_executable)?;
+    let mut zip = File::open(zip_path)?;
+    let mut target = File::create(output)?;
+    let copied_stub = io::copy(&mut stub.take(stub_length), &mut target)?;
+    if copied_stub != stub_length {
+        bail!("无法完整复制自解压程序模板");
+    }
+    let payload_offset = copied_stub;
+    let archive_bytes = io::copy(&mut zip, &mut target)?;
+    target.write_all(SFX_TRAILER_MAGIC)?;
+    target.write_all(&payload_offset.to_le_bytes())?;
+    target.flush()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(output, fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(OperationSummary {
+        files: 1,
+        directories: 0,
+        bytes: archive_bytes,
+    })
+}
+
+pub fn extract_self_extracting(
+    executable: &Path,
+    destination: &Path,
+    password: Option<&str>,
+    on_progress: impl FnMut(Progress),
+) -> Result<OperationSummary> {
+    let (offset, length) =
+        sfx_payload_range(executable)?.ok_or_else(|| anyhow!("文件不包含妙压自解压数据"))?;
+    let mut input = File::open(executable)?;
+    input.seek(SeekFrom::Start(offset))?;
+    let mut temporary = tempfile::Builder::new().suffix(".zip").tempfile()?;
+    let copied = io::copy(&mut input.take(length), &mut temporary)?;
+    if copied != length {
+        bail!("自解压数据不完整");
+    }
+    temporary.flush()?;
+    extract_zip_archive(temporary.path(), destination, password, on_progress)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn extract_archive(
     archive_path: &Path,
     destination: &Path,
     on_progress: impl FnMut(Progress),
 ) -> Result<OperationSummary> {
+    extract_archive_with_password(archive_path, destination, None, on_progress)
+}
+
+pub fn extract_archive_with_password(
+    archive_path: &Path,
+    destination: &Path,
+    password: Option<&str>,
+    on_progress: impl FnMut(Progress),
+) -> Result<OperationSummary> {
     match ArchiveFormat::from_path(archive_path) {
-        Some(ArchiveFormat::Zip) => extract_zip_archive(archive_path, destination, on_progress),
+        Some(ArchiveFormat::Zip) => {
+            extract_zip_archive(archive_path, destination, password, on_progress)
+        }
         Some(ArchiveFormat::SevenZip) => extract_7z_archive(archive_path, destination, on_progress),
         Some(ArchiveFormat::Rar) => extract_rar_archive(archive_path, destination, on_progress),
         Some(
@@ -369,6 +741,7 @@ pub fn extract_archive(
 fn extract_zip_archive(
     archive_path: &Path,
     destination: &Path,
+    password: Option<&str>,
     mut on_progress: impl FnMut(Progress),
 ) -> Result<OperationSummary> {
     let input = File::open(archive_path)
@@ -378,15 +751,14 @@ fn extract_zip_archive(
     // Validate every entry before writing anything. `enclosed_name` blocks absolute
     // paths and parent traversal such as ../../outside.txt.
     for index in 0..archive.len() {
-        let entry = archive.by_index(index).context("无法读取 ZIP 文件目录")?;
+        let entry = archive
+            .by_index_raw(index)
+            .context("无法读取 ZIP 文件目录")?;
         if entry.enclosed_name().is_none() {
             bail!("压缩包包含不安全路径：{}", entry.name());
         }
         if entry.is_symlink() {
             bail!("为安全起见，不解压符号链接：{}", entry.name());
-        }
-        if entry.encrypted() {
-            bail!("暂不支持加密 ZIP：{}", entry.name());
         }
     }
 
@@ -399,9 +771,19 @@ fn extract_zip_archive(
     let total = archive.len();
     let mut summary = OperationSummary::default();
     for index in 0..total {
-        let mut entry = archive
-            .by_index(index)
-            .with_context(|| format!("无法读取 ZIP 中的第 {} 项", index + 1))?;
+        let encrypted = archive.by_index_raw(index)?.encrypted();
+        let mut entry = if encrypted {
+            let password = password
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("ZIP 已加密，请输入密码"))?;
+            archive
+                .by_index_decrypt(index, password.as_bytes())
+                .with_context(|| format!("密码错误，无法读取 ZIP 中的第 {} 项", index + 1))?
+        } else {
+            archive
+                .by_index(index)
+                .with_context(|| format!("无法读取 ZIP 中的第 {} 项", index + 1))?
+        };
         let relative_path = entry
             .enclosed_name()
             .ok_or_else(|| anyhow!("压缩包包含不安全路径：{}", entry.name()))?;
@@ -1182,6 +1564,104 @@ mod tests {
         let mut archive = ZipArchive::new(File::open(archive_path).unwrap()).unwrap();
         let entry = archive.by_name("plain.txt").unwrap();
         assert_eq!(entry.compression(), CompressionMethod::Stored);
+    }
+
+    #[test]
+    fn updates_zip_by_adding_and_removing_entries() {
+        let temp = TestDirectory::new("zip-update");
+        let first = temp.0.join("first.txt");
+        let second = temp.0.join("second.txt");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+        let archive_path = temp.0.join("editable.zip");
+        create_archive(
+            std::slice::from_ref(&first),
+            &archive_path,
+            ArchiveFormat::Zip,
+            6,
+            |_| {},
+        )
+        .unwrap();
+        update_zip_archive(
+            &archive_path,
+            &[second],
+            &HashSet::from(["first.txt".to_owned()]),
+            "inside",
+            6,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let listing = list_archive_entries(&archive_path).unwrap();
+        assert!(!listing.iter().any(|entry| entry.path == "first.txt"));
+        assert!(
+            listing
+                .iter()
+                .any(|entry| entry.path == "inside/second.txt")
+        );
+    }
+
+    #[test]
+    fn creates_extracts_and_changes_aes_zip_password() {
+        let temp = TestDirectory::new("zip-password");
+        let source = temp.0.join("secret.txt");
+        fs::write(&source, b"classified").unwrap();
+        let archive_path = temp.0.join("secret.zip");
+        create_archive_with_password(
+            &[source],
+            &archive_path,
+            ArchiveFormat::Zip,
+            6,
+            Some("old-password"),
+            |_| {},
+        )
+        .unwrap();
+        assert!(list_archive_entries(&archive_path).unwrap()[0].encrypted);
+        assert!(validate_zip_password(&archive_path, "wrong").is_err());
+        validate_zip_password(&archive_path, "old-password").unwrap();
+
+        let wrong_output = temp.0.join("wrong");
+        assert!(
+            extract_archive_with_password(&archive_path, &wrong_output, Some("wrong"), |_| {})
+                .is_err()
+        );
+        validate_zip_password(&archive_path, "old-password").unwrap();
+
+        rewrite_zip_password(
+            &archive_path,
+            Some("old-password"),
+            Some("new-password"),
+            |_| {},
+        )
+        .unwrap();
+        assert!(validate_zip_password(&archive_path, "old-password").is_err());
+        validate_zip_password(&archive_path, "new-password").unwrap();
+
+        rewrite_zip_password(&archive_path, Some("new-password"), None, |_| {}).unwrap();
+        assert!(!list_archive_entries(&archive_path).unwrap()[0].encrypted);
+        let output = temp.0.join("out");
+        extract_archive(&archive_path, &output, |_| {}).unwrap();
+        assert_eq!(fs::read(output.join("secret.txt")).unwrap(), b"classified");
+    }
+
+    #[test]
+    fn builds_and_extracts_self_extracting_payload() {
+        let temp = TestDirectory::new("sfx");
+        let source = temp.0.join("payload.txt");
+        fs::write(&source, b"self extracting").unwrap();
+        let archive_path = temp.0.join("payload.zip");
+        create_archive(&[source], &archive_path, ArchiveFormat::Zip, 6, |_| {}).unwrap();
+        let stub = temp.0.join("stub.exe");
+        fs::write(&stub, b"fake executable stub").unwrap();
+        let sfx = temp.0.join("payload.exe");
+        create_self_extracting(&stub, &archive_path, &sfx).unwrap();
+        assert!(is_self_extracting(&sfx));
+        let output = temp.0.join("out");
+        extract_self_extracting(&sfx, &output, None, |_| {}).unwrap();
+        assert_eq!(
+            fs::read(output.join("payload.txt")).unwrap(),
+            b"self extracting"
+        );
     }
 
     #[test]

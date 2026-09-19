@@ -73,6 +73,13 @@ enum JobStatus {
     Error(String),
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum PasswordDialogMode {
+    #[default]
+    Unlock,
+    Change,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 pub struct MiaoZipApp {
@@ -120,7 +127,11 @@ pub struct MiaoZipApp {
     #[serde(skip)]
     show_create_dialog: bool,
     #[serde(skip)]
+    show_add_to_archive_dialog: bool,
+    #[serde(skip)]
     context_only_add: bool,
+    #[serde(skip)]
+    context_only_extract: bool,
     #[serde(skip)]
     context_add_started: bool,
     #[serde(skip)]
@@ -133,6 +144,26 @@ pub struct MiaoZipApp {
     extract_dialog_tab: u8,
     #[serde(skip)]
     show_delete_dialog: bool,
+    #[serde(skip)]
+    show_password_dialog: bool,
+    #[serde(skip)]
+    password_dialog_mode: PasswordDialogMode,
+    #[serde(skip)]
+    archive_password: String,
+    #[serde(skip)]
+    archive_password_confirm: String,
+    #[serde(skip)]
+    current_archive_password: String,
+    #[serde(skip)]
+    new_archive_password: String,
+    #[serde(skip)]
+    new_archive_password_confirm: String,
+    #[serde(skip)]
+    pending_password_after_job: Option<String>,
+    #[serde(skip)]
+    reload_archive_after_job: bool,
+    #[serde(skip)]
+    extracting_sfx: bool,
     #[serde(skip)]
     show_info_dialog: bool,
     #[serde(skip)]
@@ -285,13 +316,25 @@ impl Default for MiaoZipApp {
             status: JobStatus::Idle,
             worker: None,
             show_create_dialog: false,
+            show_add_to_archive_dialog: false,
             context_only_add: false,
+            context_only_extract: false,
             context_add_started: false,
             create_dialog_tab: 0,
             selected_source: None,
             show_extract_dialog: false,
             extract_dialog_tab: 0,
             show_delete_dialog: false,
+            show_password_dialog: false,
+            password_dialog_mode: PasswordDialogMode::Unlock,
+            archive_password: String::new(),
+            archive_password_confirm: String::new(),
+            current_archive_password: String::new(),
+            new_archive_password: String::new(),
+            new_archive_password_confirm: String::new(),
+            pending_password_after_job: None,
+            reload_archive_after_job: false,
+            extracting_sfx: false,
             show_info_dialog: false,
             show_about_dialog: false,
             show_formats_dialog: false,
@@ -366,13 +409,15 @@ impl MiaoZipApp {
         launch_action: LaunchAction,
     ) -> Self {
         let context_only_add = matches!(&launch_action, LaunchAction::AddContext(_));
+        let context_only_extract = matches!(&launch_action, LaunchAction::ExtractHere(_));
+        let context_only_operation = context_only_add || context_only_extract;
         install_cjk_font(&creation_context.egui_ctx);
         apply_haozip_visuals(&creation_context.egui_ctx);
         creation_context.egui_ctx.set_embed_viewports(false);
         #[cfg(windows)]
         {
             creation_context.egui_ctx.set_pixels_per_point(1.0);
-            if !context_only_add {
+            if !context_only_operation {
                 creation_context
                     .egui_ctx
                     .send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1200.0, 753.0)));
@@ -384,7 +429,8 @@ impl MiaoZipApp {
             .and_then(|storage| eframe::get_value(storage, eframe::APP_KEY))
             .unwrap_or_default();
         app.context_only_add = context_only_add;
-        if !context_only_add {
+        app.context_only_extract = context_only_extract;
+        if !context_only_operation {
             app.start_tree_icon_loader(&creation_context.egui_ctx);
         }
         app.context_add_started = false;
@@ -397,7 +443,9 @@ impl MiaoZipApp {
         app.history = vec![PathBuf::new()];
         app.history_index = 0;
         app.selected_drive = drive_entries().first().map(|drive| drive.path.clone());
-        app.refresh_entries();
+        if !context_only_operation {
+            app.refresh_entries();
+        }
         match launch_action {
             LaunchAction::Normal => {
                 app.show_default_prompt = should_show_registration_prompt(
@@ -406,6 +454,10 @@ impl MiaoZipApp {
                     integration::default_association_count(),
                     integration::supported_association_extensions().count(),
                 );
+            }
+            LaunchAction::FirstRun => {
+                app.show_default_prompt = true;
+                app.dont_ask_again = false;
             }
             LaunchAction::Add(paths) | LaunchAction::AddContext(paths) => {
                 if paths.iter().all(|path| path.exists()) {
@@ -440,6 +492,14 @@ impl MiaoZipApp {
                         app.extract_output =
                             Some(archive.parent().unwrap_or(Path::new(".")).to_path_buf());
                     }
+                    // “解压到当前目录”是无设置页的快捷动作，不能继承普通
+                    // 解压对话框中可能保存的“禁止覆盖”选项，否则目标父目录
+                    // 必然已存在，任务会在进度窗口出现前直接失败。
+                    app.overwrite_existing = true;
+                    app.show_extract_dialog = false;
+                    if app.start_extraction(&creation_context.egui_ctx) {
+                        app.show_progress_dialog = false;
+                    }
                 } else {
                     app.status = JobStatus::Error("无法打开：不支持此压缩格式".to_owned());
                 }
@@ -456,10 +516,22 @@ impl MiaoZipApp {
                     app.status = JobStatus::Error("无法打开：不是有效的 ISO 镜像路径".to_owned());
                 }
             }
+            LaunchAction::SelfExtract(path) => {
+                app.current_directory = path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf();
+                app.extract_output = Some(app.current_directory.join(archive_base_name(&path)));
+                app.zip_input = Some(path);
+                app.extracting_sfx = true;
+                app.overwrite_existing = true;
+                app.show_extract_dialog = true;
+            }
             LaunchAction::Invalid(message) => app.status = JobStatus::Error(message),
             LaunchAction::RegisterIntegration
             | LaunchAction::SetDefaultArchives
-            | LaunchAction::RemoveContextMenu => {
+            | LaunchAction::RemoveContextMenu
+            | LaunchAction::UnregisterIntegration => {
                 unreachable!("system integration commands are handled before opening the UI")
             }
         }
@@ -632,6 +704,10 @@ impl MiaoZipApp {
         if paths.is_empty() {
             return;
         }
+        if self.opened_archive.is_some() {
+            self.start_zip_update(context, paths, HashSet::new());
+            return;
+        }
         if paths.len() == 1 && is_archive_file(&paths[0]) {
             self.open_archive(paths[0].clone());
         } else {
@@ -642,6 +718,16 @@ impl MiaoZipApp {
     }
 
     fn prepare_add_dialog(&mut self) {
+        if let Some(archive) = &self.opened_archive {
+            if ArchiveFormat::from_path(archive) != Some(ArchiveFormat::Zip) {
+                self.status = JobStatus::Error("目前仅支持向 ZIP 压缩包中添加文件".to_owned());
+                return;
+            }
+            self.sources.clear();
+            self.selected_source = None;
+            self.show_add_to_archive_dialog = true;
+            return;
+        }
         if self.selected_paths.is_empty() {
             if let Some(files) = FileDialog::new().pick_files() {
                 self.sources = files;
@@ -653,6 +739,68 @@ impl MiaoZipApp {
         }
         self.prepare_archive_destination();
         self.show_create_dialog = true;
+    }
+
+    fn start_zip_update(
+        &mut self,
+        context: &egui::Context,
+        additions: Vec<PathBuf>,
+        removed: HashSet<String>,
+    ) -> bool {
+        let Some(archive_path) = self.opened_archive.clone() else {
+            return false;
+        };
+        if ArchiveFormat::from_path(&archive_path) != Some(ArchiveFormat::Zip) {
+            self.status = JobStatus::Error("目前仅支持编辑 ZIP 压缩包".to_owned());
+            return false;
+        }
+        if !additions.is_empty()
+            && self.archive_entries.iter().any(|entry| entry.encrypted)
+            && self.archive_password.is_empty()
+        {
+            self.password_dialog_mode = PasswordDialogMode::Unlock;
+            self.show_password_dialog = true;
+            self.status = JobStatus::Error("请先输入 ZIP 密码，再添加文件".to_owned());
+            return false;
+        }
+        let target_prefix = self.archive_directory.clone();
+        let compression_level = self.compression_level;
+        let password = (!self.archive_password.is_empty()).then(|| self.archive_password.clone());
+        let (sender, receiver) = mpsc::channel();
+        let repaint_context = context.clone();
+        self.worker = Some(receiver);
+        self.reload_archive_after_job = true;
+        self.status = JobStatus::Running {
+            operation: if removed.is_empty() {
+                "正在添加文件"
+            } else if additions.is_empty() {
+                "正在从压缩包删除"
+            } else {
+                "正在更新压缩包"
+            },
+            completed: 0,
+            total: 0,
+            current: String::new(),
+        };
+        self.show_progress_dialog = true;
+        thread::spawn(move || {
+            let result = archive::update_zip_archive(
+                &archive_path,
+                &additions,
+                &removed,
+                &target_prefix,
+                compression_level,
+                password.as_deref(),
+                |progress| {
+                    let _ = sender.send(WorkerMessage::Progress(progress));
+                    repaint_context.request_repaint();
+                },
+            )
+            .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(WorkerMessage::Finished(result));
+            repaint_context.request_repaint();
+        });
+        true
     }
 
     fn prepare_archive_destination(&mut self) {
@@ -704,6 +852,9 @@ impl MiaoZipApp {
         self.archive_entries.clear();
         self.archive_listing_worker = None;
         self.selected_archive_item = None;
+        self.archive_password.clear();
+        self.current_archive_password.clear();
+        self.show_password_dialog = false;
     }
 
     fn open_archive(&mut self, path: PathBuf) {
@@ -748,9 +899,15 @@ impl MiaoZipApp {
             self.archive_listing_worker = None;
             match result {
                 Ok(entries) => {
+                    let encrypted = entries.iter().any(|entry| entry.encrypted);
                     self.archive_entries = entries;
                     self.refresh_archive_directory();
                     self.status = JobStatus::Idle;
+                    if encrypted && self.archive_password.is_empty() {
+                        self.password_dialog_mode = PasswordDialogMode::Unlock;
+                        self.current_archive_password.clear();
+                        self.show_password_dialog = true;
+                    }
                 }
                 Err(error) => {
                     self.browser_error = Some(format!("无法读取压缩包：{error}"));
@@ -795,12 +952,17 @@ impl MiaoZipApp {
             return;
         }
         let entry_name = entry.to_string_lossy().into_owned();
+        let password = (!self.archive_password.is_empty()).then(|| self.archive_password.clone());
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let result = (|| -> anyhow::Result<(PathBuf, TempDir, PathBuf)> {
                 let temporary = tempfile::tempdir()?;
-                let file =
-                    archive::extract_entry_for_open(&archive_path, &entry_name, temporary.path())?;
+                let file = archive::extract_entry_for_open_with_password(
+                    &archive_path,
+                    &entry_name,
+                    temporary.path(),
+                    password.as_deref(),
+                )?;
                 Ok((archive_path, temporary, file))
             })()
             .map_err(|error| format!("{error:#}"));
@@ -926,6 +1088,13 @@ impl MiaoZipApp {
                 Ok(WorkerMessage::Finished(result)) => {
                     self.worker = None;
                     self.refresh_after_job = true;
+                    if result.is_ok()
+                        && let Some(password) = self.pending_password_after_job.take()
+                    {
+                        self.archive_password = password;
+                    } else if result.is_err() {
+                        self.pending_password_after_job = None;
+                    }
                     self.status = match result {
                         Ok(summary) => JobStatus::Success(format!(
                             "操作完成：{} 个文件，{} 个目录，共 {}",
@@ -948,7 +1117,12 @@ impl MiaoZipApp {
 
         if self.refresh_after_job && !self.is_running() {
             self.refresh_after_job = false;
-            self.refresh_entries();
+            if self.reload_archive_after_job && self.opened_archive.is_some() {
+                self.reload_archive_after_job = false;
+                self.load_archive_listing();
+            } else if !self.context_only_extract {
+                self.refresh_entries();
+            }
         }
     }
 
@@ -965,6 +1139,17 @@ impl MiaoZipApp {
         let sources = self.sources.clone();
         let compression_level = self.compression_level;
         let archive_format = self.archive_format;
+        if !self.archive_password.is_empty() {
+            if archive_format != ArchiveFormat::Zip {
+                self.status = JobStatus::Error("密码压缩目前只支持 ZIP".to_owned());
+                return false;
+            }
+            if self.archive_password != self.archive_password_confirm {
+                self.status = JobStatus::Error("两次输入的密码不一致".to_owned());
+                return false;
+            }
+        }
+        let password = (!self.archive_password.is_empty()).then(|| self.archive_password.clone());
         let (sender, receiver) = mpsc::channel();
         let repaint_context = context.clone();
         self.worker = Some(receiver);
@@ -977,11 +1162,12 @@ impl MiaoZipApp {
         self.show_progress_dialog = !self.context_only_add;
 
         thread::spawn(move || {
-            let result = archive::create_archive(
+            let result = archive::create_archive_with_password(
                 &sources,
                 &destination,
                 archive_format,
                 compression_level,
+                password.as_deref(),
                 |progress| {
                     let _ = sender.send(WorkerMessage::Progress(progress));
                     repaint_context.request_repaint();
@@ -1011,6 +1197,8 @@ impl MiaoZipApp {
 
         let (sender, receiver) = mpsc::channel();
         let repaint_context = context.clone();
+        let password = (!self.archive_password.is_empty()).then(|| self.archive_password.clone());
+        let self_extracting = self.extracting_sfx;
         self.worker = Some(receiver);
         self.status = JobStatus::Running {
             operation: "正在解压",
@@ -1021,10 +1209,25 @@ impl MiaoZipApp {
         self.show_progress_dialog = true;
 
         thread::spawn(move || {
-            let result = archive::extract_archive(&archive_path, &destination, |progress| {
+            let notify = |progress| {
                 let _ = sender.send(WorkerMessage::Progress(progress));
                 repaint_context.request_repaint();
-            })
+            };
+            let result = if self_extracting {
+                archive::extract_self_extracting(
+                    &archive_path,
+                    &destination,
+                    password.as_deref(),
+                    notify,
+                )
+            } else {
+                archive::extract_archive_with_password(
+                    &archive_path,
+                    &destination,
+                    password.as_deref(),
+                    notify,
+                )
+            }
             .map_err(|error| format!("{error:#}"));
             let _ = sender.send(WorkerMessage::Finished(result));
             repaint_context.request_repaint();
@@ -1176,7 +1379,17 @@ impl MiaoZipApp {
         }
     }
 
-    fn delete_selected(&mut self) {
+    fn delete_selected(&mut self, context: &egui::Context) {
+        if self.opened_archive.is_some() {
+            let Some(selected) = self.selected_archive_item.take() else {
+                self.status = JobStatus::Error("请先选择压缩包内项目".to_owned());
+                return;
+            };
+            let mut removed = HashSet::new();
+            removed.insert(selected.to_string_lossy().replace('\\', "/"));
+            self.start_zip_update(context, Vec::new(), removed);
+            return;
+        }
         let mut deleted = 0;
         let mut errors = Vec::new();
         for path in &self.selected_paths {
@@ -1279,6 +1492,13 @@ impl MiaoZipApp {
             ui.add_space(14.0);
             if !self.context_only_add && ui.link("切换至经典模式").clicked() {
                 self.quick_create_mode = false;
+            }
+            if !self.context_only_add
+                && self.archive_format == ArchiveFormat::Zip
+                && ui.link("设置密码").clicked()
+            {
+                self.quick_create_mode = false;
+                self.create_dialog_tab = 0;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
@@ -1384,6 +1604,139 @@ impl MiaoZipApp {
         }
     }
 
+    fn show_context_extract_root(&mut self, root: &mut egui::Ui) {
+        let context = root.ctx().clone();
+        if self.is_running() && root.input(|input| input.viewport().close_requested()) {
+            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+
+        if matches!(self.status, JobStatus::Success(_)) {
+            context.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+
+        let (running, title, detail, fraction) = match &self.status {
+            JobStatus::Running {
+                completed,
+                total,
+                current,
+                ..
+            } => (
+                true,
+                "正在解压",
+                if current.is_empty() {
+                    "正在准备文件…".to_owned()
+                } else {
+                    current.clone()
+                },
+                if *total == 0 {
+                    0.0
+                } else {
+                    (*completed as f32 / *total as f32).clamp(0.0, 1.0)
+                },
+            ),
+            JobStatus::Error(message) => (false, "解压失败", message.clone(), 0.0),
+            JobStatus::Idle => (false, "无法解压", "解压任务未能启动".to_owned(), 0.0),
+            JobStatus::Success(_) => unreachable!("successful quick extraction closes above"),
+        };
+
+        let mut close = false;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(BLUE).inner_margin(0))
+            .show(root, |ui| {
+                let rect = ui.max_rect();
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(13, 120, 200));
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        egui::pos2(rect.left() + 265.0, rect.top()),
+                        egui::pos2(rect.right(), rect.top()),
+                        egui::pos2(rect.right() - 120.0, rect.bottom()),
+                        egui::pos2(rect.left() + 95.0, rect.bottom()),
+                    ],
+                    egui::Color32::from_white_alpha(14),
+                    egui::Stroke::NONE,
+                ));
+                painter.text(
+                    egui::pos2(rect.left() + 24.0, rect.top() + 20.0),
+                    egui::Align2::LEFT_TOP,
+                    "▣  妙压",
+                    egui::FontId::proportional(15.0),
+                    egui::Color32::WHITE,
+                );
+                painter.text(
+                    egui::pos2(rect.left() + 30.0, rect.top() + 77.0),
+                    egui::Align2::LEFT_TOP,
+                    title,
+                    egui::FontId::proportional(22.0),
+                    egui::Color32::WHITE,
+                );
+                painter.text(
+                    egui::pos2(rect.right() - 25.0, rect.top() + 51.0),
+                    egui::Align2::RIGHT_TOP,
+                    format!("{}%", (fraction * 100.0).round() as u32),
+                    egui::FontId::proportional(48.0),
+                    egui::Color32::WHITE,
+                );
+                let detail = if detail.chars().count() > 56 {
+                    format!("{}…", detail.chars().take(55).collect::<String>())
+                } else {
+                    detail
+                };
+                painter.text(
+                    egui::pos2(rect.left() + 30.0, rect.top() + 118.0),
+                    egui::Align2::LEFT_TOP,
+                    detail,
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_rgb(225, 242, 255),
+                );
+                let track = egui::Rect::from_min_size(
+                    egui::pos2(rect.left() + 30.0, rect.top() + 157.0),
+                    egui::vec2(rect.width() - 60.0, 7.0),
+                );
+                painter.rect_filled(track, 4.0, egui::Color32::from_white_alpha(90));
+                painter.rect_filled(
+                    egui::Rect::from_min_size(
+                        track.min,
+                        egui::vec2(track.width() * fraction, track.height()),
+                    ),
+                    4.0,
+                    egui::Color32::WHITE,
+                );
+                if running {
+                    painter.text(
+                        egui::pos2(rect.left() + 30.0, rect.bottom() - 31.0),
+                        egui::Align2::LEFT_TOP,
+                        "解压完成后窗口将自动关闭",
+                        egui::FontId::proportional(12.0),
+                        egui::Color32::from_rgb(218, 237, 253),
+                    );
+                } else {
+                    let button = egui::Rect::from_min_size(
+                        egui::pos2(rect.right() - 110.0, rect.bottom() - 46.0),
+                        egui::vec2(80.0, 27.0),
+                    );
+                    let response = ui.interact(
+                        button,
+                        egui::Id::new("quick_extract_close"),
+                        egui::Sense::click(),
+                    );
+                    painter.rect_filled(button, 3.0, egui::Color32::WHITE);
+                    painter.text(
+                        button.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "关闭",
+                        egui::FontId::proportional(14.0),
+                        BLUE,
+                    );
+                    close = response.clicked();
+                }
+            });
+        if close {
+            context.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
     fn show_create_archive_dialog(&mut self, context: &egui::Context) {
         if !self.show_create_dialog {
             return;
@@ -1409,91 +1762,125 @@ impl MiaoZipApp {
                 egui::CentralPanel::default()
                     .frame(operation_dialog_frame())
                     .show(viewport, |ui| {
-                if self.quick_create_mode {
-                    self.show_quick_create_contents(context, ui, &mut close_after_start);
-                    return;
-                }
-                operation_heading(ui, "压缩文件名和参数", "选择压缩格式、方式及待添加文件");
-                operation_tabs(ui, &mut self.create_dialog_tab, &["常规", "文件"]);
-                ui.add_space(10.0);
-                ui.label("压缩文件名及路径：");
-                ui.horizontal(|ui| {
-                    let mut text = self
-                        .archive_output
-                        .as_ref()
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_default();
-                    if ui
-                        .add_sized([522.0, 26.0], egui::TextEdit::singleline(&mut text))
-                        .changed()
-                    {
-                        self.archive_output = Some(PathBuf::from(text));
-                    }
-                    if ui.add_sized([70.0, 26.0], egui::Button::new("浏览...")).clicked()
-                        && let Some(path) = FileDialog::new()
-                            .add_filter(
-                                "所选格式",
-                                &[self.archive_format.extension().trim_start_matches('.')],
-                            )
-                            .set_file_name(format!(
-                                "新建压缩文件{}",
-                                self.archive_format.extension()
-                            ))
-                            .save_file()
-                    {
-                        self.archive_output =
-                            Some(ensure_archive_extension(path, self.archive_format));
-                    }
-                });
-                ui.add_space(12.0);
-                let previous = self.archive_format;
-                if self.create_dialog_tab == 0 {
-                    ui.columns(2, |columns| {
-                        columns[0].group(|ui| {
-                            ui.set_min_height(230.0);
-                            ui.label(egui::RichText::new("压缩格式").strong());
-                            ui.add_space(5.0);
-                            ui.horizontal(|ui| {
-                                ui.radio_value(&mut self.archive_format, ArchiveFormat::Zip, "ZIP");
-                                ui.radio_value(&mut self.archive_format, ArchiveFormat::SevenZip, "7Z");
-                                ui.radio_value(&mut self.archive_format, ArchiveFormat::Tar, "TAR");
-                            });
-                            ui.add_space(5.0);
-                            ui.horizontal(|ui| {
-                                ui.label("更多格式：");
-                                egui::ComboBox::from_id_salt("archive_format")
-                                    .selected_text(self.archive_format.label())
-                                    .width(128.0)
-                                    .show_ui(ui, |ui| {
-                                        for format in ArchiveFormat::CREATABLE {
-                                            ui.selectable_value(&mut self.archive_format, format, format.label());
-                                        }
-                                    });
-                            });
-                            ui.separator();
-                            ui.label(egui::RichText::new("压缩方式").strong());
-                            ui.add_space(4.0);
-                            ui.add_enabled_ui(
-                                !matches!(self.archive_format, ArchiveFormat::SevenZip | ArchiveFormat::Tar),
-                                |ui| {
-                                    egui::ComboBox::from_id_salt("compression_method")
-                                        .selected_text(compression_label(self.compression_level))
-                                        .width(235.0)
-                                        .show_ui(ui, |ui| {
-                                            for (level, label) in [(0, "存储"), (1, "最快"), (3, "快速"), (6, "标准"), (8, "较好"), (9, "最好")] {
-                                                ui.selectable_value(&mut self.compression_level, level, label);
-                                            }
-                                        });
-                                },
-                            );
-                            ui.add_space(5.0);
-                            ui.weak(match self.archive_format {
-                                ArchiveFormat::SevenZip => "7Z 当前使用固定 LZMA2 配置。",
-                                ArchiveFormat::Tar => "TAR 仅打包，不进行压缩。",
-                                _ => "级别越高，压缩通常越慢。",
-                            });
+                        if self.quick_create_mode {
+                            self.show_quick_create_contents(context, ui, &mut close_after_start);
+                            return;
+                        }
+                        operation_heading(ui, "压缩文件名和参数", "选择压缩格式、方式及待添加文件");
+                        operation_tabs(ui, &mut self.create_dialog_tab, &["常规", "文件"]);
+                        ui.add_space(10.0);
+                        ui.label("压缩文件名及路径：");
+                        ui.horizontal(|ui| {
+                            let mut text = self
+                                .archive_output
+                                .as_ref()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_default();
+                            if ui
+                                .add_sized([522.0, 26.0], egui::TextEdit::singleline(&mut text))
+                                .changed()
+                            {
+                                self.archive_output = Some(PathBuf::from(text));
+                            }
+                            if ui
+                                .add_sized([70.0, 26.0], egui::Button::new("浏览..."))
+                                .clicked()
+                                && let Some(path) = FileDialog::new()
+                                    .add_filter(
+                                        "所选格式",
+                                        &[self.archive_format.extension().trim_start_matches('.')],
+                                    )
+                                    .set_file_name(format!(
+                                        "新建压缩文件{}",
+                                        self.archive_format.extension()
+                                    ))
+                                    .save_file()
+                            {
+                                self.archive_output =
+                                    Some(ensure_archive_extension(path, self.archive_format));
+                            }
                         });
-                        columns[1].group(|ui| {
+                        ui.add_space(12.0);
+                        let previous = self.archive_format;
+                        if self.create_dialog_tab == 0 {
+                            ui.columns(2, |columns| {
+                                columns[0].group(|ui| {
+                                    ui.set_min_height(230.0);
+                                    ui.label(egui::RichText::new("压缩格式").strong());
+                                    ui.add_space(5.0);
+                                    ui.horizontal(|ui| {
+                                        ui.radio_value(
+                                            &mut self.archive_format,
+                                            ArchiveFormat::Zip,
+                                            "ZIP",
+                                        );
+                                        ui.radio_value(
+                                            &mut self.archive_format,
+                                            ArchiveFormat::SevenZip,
+                                            "7Z",
+                                        );
+                                        ui.radio_value(
+                                            &mut self.archive_format,
+                                            ArchiveFormat::Tar,
+                                            "TAR",
+                                        );
+                                    });
+                                    ui.add_space(5.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("更多格式：");
+                                        egui::ComboBox::from_id_salt("archive_format")
+                                            .selected_text(self.archive_format.label())
+                                            .width(128.0)
+                                            .show_ui(ui, |ui| {
+                                                for format in ArchiveFormat::CREATABLE {
+                                                    ui.selectable_value(
+                                                        &mut self.archive_format,
+                                                        format,
+                                                        format.label(),
+                                                    );
+                                                }
+                                            });
+                                    });
+                                    ui.separator();
+                                    ui.label(egui::RichText::new("压缩方式").strong());
+                                    ui.add_space(4.0);
+                                    ui.add_enabled_ui(
+                                        !matches!(
+                                            self.archive_format,
+                                            ArchiveFormat::SevenZip | ArchiveFormat::Tar
+                                        ),
+                                        |ui| {
+                                            egui::ComboBox::from_id_salt("compression_method")
+                                                .selected_text(compression_label(
+                                                    self.compression_level,
+                                                ))
+                                                .width(235.0)
+                                                .show_ui(ui, |ui| {
+                                                    for (level, label) in [
+                                                        (0, "存储"),
+                                                        (1, "最快"),
+                                                        (3, "快速"),
+                                                        (6, "标准"),
+                                                        (8, "较好"),
+                                                        (9, "最好"),
+                                                    ] {
+                                                        ui.selectable_value(
+                                                            &mut self.compression_level,
+                                                            level,
+                                                            label,
+                                                        );
+                                                    }
+                                                });
+                                        },
+                                    );
+                                    ui.add_space(5.0);
+                                    ui.weak(match self.archive_format {
+                                        ArchiveFormat::SevenZip => "7Z 当前使用固定 LZMA2 配置。",
+                                        ArchiveFormat::Tar => "TAR 仅打包，不进行压缩。",
+                                        _ => "级别越高，压缩通常越慢。",
+                                    });
+                                });
+                                columns[1].group(|ui| {
                             ui.set_min_height(230.0);
                             ui.label(egui::RichText::new("压缩选项").strong());
                             ui.add_space(6.0);
@@ -1501,70 +1888,131 @@ impl MiaoZipApp {
                             ui.add_space(5.0);
                             ui.label("文件和目录将保留相对路径。 ");
                             ui.add_space(9.0);
-                            ui.weak("密码、分卷、自解压等功能尚未实现。为避免误操作，这些选项暂不提供。");
+                            ui.add_enabled_ui(self.archive_format == ArchiveFormat::Zip, |ui| {
+                                ui.label(egui::RichText::new("AES-256 密码（可选）").strong());
+                                ui.add_sized(
+                                    [250.0, 25.0],
+                                    egui::TextEdit::singleline(&mut self.archive_password)
+                                        .password(true)
+                                        .hint_text("输入密码"),
+                                );
+                                ui.add_sized(
+                                    [250.0, 25.0],
+                                    egui::TextEdit::singleline(
+                                        &mut self.archive_password_confirm,
+                                    )
+                                    .password(true)
+                                    .hint_text("再次输入密码"),
+                                );
+                            });
+                            ui.weak("分卷压缩暂未实现；创建 ZIP 后可用主界面的“自解压”生成 EXE。");
                         });
-                    });
-                } else {
-                    ui.group(|ui| {
-                        ui.set_min_height(230.0);
-                        ui.label(egui::RichText::new(format!("待压缩文件（{} 项）", self.sources.len())).strong());
-                        ui.separator();
-                        egui::ScrollArea::vertical().max_height(155.0).show(ui, |ui| {
-                            for (index, source) in self.sources.iter().enumerate() {
-                                let name = source.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| source.display().to_string());
-                                let label = if source.is_dir() { format!("📁 {name}") } else { format!("📄 {name}") };
-                                ui.selectable_value(&mut self.selected_source, Some(index), label)
-                                    .on_hover_text(source.display().to_string());
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            if ui.button("添加文件...").clicked()
-                                && let Some(paths) = FileDialog::new().pick_files()
-                            {
-                                for path in paths {
-                                    if !self.sources.contains(&path) { self.sources.push(path); }
-                                }
-                            }
-                            if ui.button("添加文件夹...").clicked()
-                                && let Some(path) = FileDialog::new().pick_folder()
-                                && !self.sources.contains(&path)
-                            {
-                                self.sources.push(path);
-                            }
-                            if ui.add_enabled(self.selected_source.is_some(), egui::Button::new("移除")).clicked()
-                                && let Some(index) = self.selected_source.take()
-                                && index < self.sources.len()
-                            {
-                                self.sources.remove(index);
-                            }
-                        });
-                    });
-                }
-                if previous != self.archive_format
-                    && let Some(path) = self.archive_output.as_mut()
-                {
-                    *path = replace_archive_extension(path, previous, self.archive_format);
-                }
-                ui.add_space(10.0);
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.weak(format!("{} 项  ·  {}", self.sources.len(), self.archive_format.label()));
-                    if ui.link("切换至简洁模式").clicked() {
-                        self.quick_create_mode = true;
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add_sized([76.0, 28.0], egui::Button::new("取消")).clicked() {
-                            close_after_start = true;
+                            });
+                        } else {
+                            ui.group(|ui| {
+                                ui.set_min_height(230.0);
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "待压缩文件（{} 项）",
+                                        self.sources.len()
+                                    ))
+                                    .strong(),
+                                );
+                                ui.separator();
+                                egui::ScrollArea::vertical()
+                                    .max_height(155.0)
+                                    .show(ui, |ui| {
+                                        for (index, source) in self.sources.iter().enumerate() {
+                                            let name = source
+                                                .file_name()
+                                                .map(|name| name.to_string_lossy().into_owned())
+                                                .unwrap_or_else(|| source.display().to_string());
+                                            let label = if source.is_dir() {
+                                                format!("📁 {name}")
+                                            } else {
+                                                format!("📄 {name}")
+                                            };
+                                            ui.selectable_value(
+                                                &mut self.selected_source,
+                                                Some(index),
+                                                label,
+                                            )
+                                            .on_hover_text(source.display().to_string());
+                                        }
+                                    });
+                                ui.horizontal(|ui| {
+                                    if ui.button("添加文件...").clicked()
+                                        && let Some(paths) = FileDialog::new().pick_files()
+                                    {
+                                        for path in paths {
+                                            if !self.sources.contains(&path) {
+                                                self.sources.push(path);
+                                            }
+                                        }
+                                    }
+                                    if ui.button("添加文件夹...").clicked()
+                                        && let Some(path) = FileDialog::new().pick_folder()
+                                        && !self.sources.contains(&path)
+                                    {
+                                        self.sources.push(path);
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            self.selected_source.is_some(),
+                                            egui::Button::new("移除"),
+                                        )
+                                        .clicked()
+                                        && let Some(index) = self.selected_source.take()
+                                        && index < self.sources.len()
+                                    {
+                                        self.sources.remove(index);
+                                    }
+                                });
+                            });
                         }
-                        if ui
-                            .add_enabled(!self.is_running(), egui::Button::new(egui::RichText::new("确定").color(egui::Color32::WHITE)).fill(BLUE).min_size(egui::vec2(76.0, 28.0)))
-                            .clicked()
-                            && self.start_compression(context)
+                        if previous != self.archive_format
+                            && let Some(path) = self.archive_output.as_mut()
                         {
-                            close_after_start = true;
+                            *path = replace_archive_extension(path, previous, self.archive_format);
                         }
-                    });
-                });
+                        ui.add_space(10.0);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.weak(format!(
+                                "{} 项  ·  {}",
+                                self.sources.len(),
+                                self.archive_format.label()
+                            ));
+                            if ui.link("切换至简洁模式").clicked() {
+                                self.quick_create_mode = true;
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add_sized([76.0, 28.0], egui::Button::new("取消"))
+                                        .clicked()
+                                    {
+                                        close_after_start = true;
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            !self.is_running(),
+                                            egui::Button::new(
+                                                egui::RichText::new("确定")
+                                                    .color(egui::Color32::WHITE),
+                                            )
+                                            .fill(BLUE)
+                                            .min_size(egui::vec2(76.0, 28.0)),
+                                        )
+                                        .clicked()
+                                        && self.start_compression(context)
+                                    {
+                                        close_after_start = true;
+                                    }
+                                },
+                            );
+                        });
                     });
             },
         );
@@ -1647,11 +2095,15 @@ impl MiaoZipApp {
                                     ui.add_space(8.0);
                                     ui.label(format!(
                                         "格式：{}",
-                                        self.zip_input
-                                            .as_deref()
-                                            .and_then(ArchiveFormat::from_path)
-                                            .map(ArchiveFormat::label)
-                                            .unwrap_or("未知")
+                                        if self.extracting_sfx {
+                                            Some("自解压 ZIP")
+                                        } else {
+                                            self.zip_input
+                                                .as_deref()
+                                                .and_then(ArchiveFormat::from_path)
+                                                .map(ArchiveFormat::label)
+                                        }
+                                        .unwrap_or("未知")
                                     ));
                                 });
                                 columns[1].group(|ui| {
@@ -1669,6 +2121,21 @@ impl MiaoZipApp {
                                         "目标目录已存在时停止",
                                     );
                                     ui.add_space(10.0);
+                                    if self.extracting_sfx
+                                        || self
+                                            .zip_input
+                                            .as_deref()
+                                            .and_then(ArchiveFormat::from_path)
+                                            == Some(ArchiveFormat::Zip)
+                                    {
+                                        ui.label("密码（如有）：");
+                                        ui.add_sized(
+                                            [255.0, 25.0],
+                                            egui::TextEdit::singleline(&mut self.archive_password)
+                                                .password(true),
+                                        );
+                                        ui.add_space(6.0);
+                                    }
                                     ui.weak("解压前检查压缩包路径，阻止写入目标目录之外。");
                                 });
                             });
@@ -1744,6 +2211,7 @@ impl MiaoZipApp {
         if !self.show_delete_dialog {
             return;
         }
+        let deleting_from_archive = self.opened_archive.is_some();
         let mut confirm = false;
         let close = show_native_popup(
             context,
@@ -1751,21 +2219,37 @@ impl MiaoZipApp {
             "确认删除 - 妙压",
             [440.0, 225.0],
             |ui, close| {
-                operation_heading(ui, "确认删除", "此操作不可撤销");
+                operation_heading(
+                    ui,
+                    if deleting_from_archive {
+                        "从压缩包删除"
+                    } else {
+                        "确认删除"
+                    },
+                    "此操作不可撤销",
+                );
                 ui.add_space(6.0);
                 ui.group(|ui| {
                     ui.set_min_width(ui.available_width() - 12.0);
                     ui.colored_label(
                         egui::Color32::from_rgb(182, 59, 55),
-                        egui::RichText::new(format!(
-                            "即将永久删除 {} 个项目",
-                            self.selected_paths.len()
-                        ))
+                        egui::RichText::new(if deleting_from_archive {
+                            format!(
+                                "即将从 ZIP 中移除 {} 个项目",
+                                usize::from(self.selected_archive_item.is_some())
+                            )
+                        } else {
+                            format!("即将永久删除 {} 个项目", self.selected_paths.len())
+                        })
                         .strong()
                         .size(17.0),
                     );
                     ui.add_space(5.0);
-                    ui.label("文件不会移入系统回收站，删除后无法在应用内恢复。");
+                    ui.label(if deleting_from_archive {
+                        "将重写 ZIP 并移除所选条目；原文件会在新 ZIP 写入成功前保留。"
+                    } else {
+                        "文件不会移入系统回收站，删除后无法在应用内恢复。"
+                    });
                 });
                 ui.add_space(15.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1775,7 +2259,12 @@ impl MiaoZipApp {
                     if ui
                         .add(
                             egui::Button::new(
-                                egui::RichText::new("永久删除").color(egui::Color32::WHITE),
+                                egui::RichText::new(if deleting_from_archive {
+                                    "从 ZIP 删除"
+                                } else {
+                                    "永久删除"
+                                })
+                                .color(egui::Color32::WHITE),
                             )
                             .fill(egui::Color32::from_rgb(191, 67, 61)),
                         )
@@ -1787,7 +2276,7 @@ impl MiaoZipApp {
             },
         );
         if confirm {
-            self.delete_selected();
+            self.delete_selected(context);
         }
         self.show_delete_dialog = !close && !confirm;
     }
@@ -1888,14 +2377,23 @@ impl MiaoZipApp {
                         match result {
                             Ok(remaining) => {
                                 self.invalidate_shell_icons();
-                                self.status = JobStatus::Success(if remaining.is_empty() {
-                                    "已将支持的压缩格式设为妙压默认打开方式".to_owned()
+                                let settings_error = if cfg!(windows) && !remaining.is_empty() {
+                                    integration::open_default_apps_settings().err()
                                 } else {
-                                    format!(
-                                        "已完成可直接设置的关联；请在系统设置中手动切换：{}",
+                                    None
+                                };
+                                self.status = match settings_error {
+                                    Some(error) => JobStatus::Error(format!(
+                                        "已注册文件类型，但无法自动打开 Windows 默认应用设置：{error}"
+                                    )),
+                                    None if remaining.is_empty() => JobStatus::Success(
+                                        "已将支持的压缩格式设为妙压默认打开方式".to_owned(),
+                                    ),
+                                    None => JobStatus::Success(format!(
+                                        "已打开 Windows 默认应用设置，请确认这些格式：{}",
                                         remaining.join("、")
-                                    )
-                                });
+                                    )),
+                                };
                                 self.integration_error = None;
                                 self.ask_default_on_startup = false;
                                 *close = true;
@@ -2408,6 +2906,324 @@ impl MiaoZipApp {
         self.show_formats_dialog = !close;
     }
 
+    fn show_add_to_archive_dialog(&mut self, context: &egui::Context) {
+        if !self.show_add_to_archive_dialog {
+            return;
+        }
+        let mut start = false;
+        let close = show_native_popup(
+            context,
+            "miaozip_add_to_archive",
+            "添加到压缩包 - 妙压",
+            [590.0, 410.0],
+            |ui, close| {
+                operation_heading(ui, "添加到当前 ZIP", "可添加文件、文件夹，或直接拖入主列表");
+                ui.add_space(8.0);
+                ui.group(|ui| {
+                    ui.set_min_width(ui.available_width() - 12.0);
+                    ui.label(format!("目标目录：/{}", self.archive_directory));
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .max_height(205.0)
+                        .show(ui, |ui| {
+                            for (index, source) in self.sources.iter().enumerate() {
+                                let name = source
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| source.display().to_string());
+                                ui.selectable_value(
+                                    &mut self.selected_source,
+                                    Some(index),
+                                    if source.is_dir() {
+                                        format!("📁 {name}")
+                                    } else {
+                                        format!("📄 {name}")
+                                    },
+                                )
+                                .on_hover_text(source.display().to_string());
+                            }
+                        });
+                    ui.horizontal(|ui| {
+                        if ui.button("添加文件...").clicked()
+                            && let Some(paths) = FileDialog::new().pick_files()
+                        {
+                            for path in paths {
+                                if !self.sources.contains(&path) {
+                                    self.sources.push(path);
+                                }
+                            }
+                        }
+                        if ui.button("添加文件夹...").clicked()
+                            && let Some(path) = FileDialog::new().pick_folder()
+                            && !self.sources.contains(&path)
+                        {
+                            self.sources.push(path);
+                        }
+                        if ui
+                            .add_enabled(self.selected_source.is_some(), egui::Button::new("移除"))
+                            .clicked()
+                            && let Some(index) = self.selected_source.take()
+                            && index < self.sources.len()
+                        {
+                            self.sources.remove(index);
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("取消").clicked() {
+                        *close = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.sources.is_empty(),
+                            egui::Button::new(
+                                egui::RichText::new("添加").color(egui::Color32::WHITE),
+                            )
+                            .fill(BLUE),
+                        )
+                        .clicked()
+                    {
+                        start = true;
+                    }
+                });
+            },
+        );
+        if start {
+            let sources = std::mem::take(&mut self.sources);
+            if self.start_zip_update(context, sources, HashSet::new()) {
+                self.show_add_to_archive_dialog = false;
+            }
+        } else {
+            self.show_add_to_archive_dialog = !close;
+        }
+    }
+
+    fn open_password_dialog(&mut self) {
+        let Some(path) = &self.opened_archive else {
+            self.status = JobStatus::Error("请先打开 ZIP 压缩包".to_owned());
+            return;
+        };
+        if ArchiveFormat::from_path(path) != Some(ArchiveFormat::Zip) {
+            self.status = JobStatus::Error("密码管理目前仅支持 ZIP".to_owned());
+            return;
+        }
+        self.password_dialog_mode = PasswordDialogMode::Change;
+        self.current_archive_password = self.archive_password.clone();
+        self.new_archive_password.clear();
+        self.new_archive_password_confirm.clear();
+        self.show_password_dialog = true;
+    }
+
+    fn start_password_rewrite(&mut self, context: &egui::Context) -> bool {
+        let Some(archive_path) = self.opened_archive.clone() else {
+            return false;
+        };
+        let encrypted = self.archive_entries.iter().any(|entry| entry.encrypted);
+        if encrypted && self.current_archive_password.is_empty() {
+            self.status = JobStatus::Error("请输入当前密码".to_owned());
+            return false;
+        }
+        if self.new_archive_password != self.new_archive_password_confirm {
+            self.status = JobStatus::Error("两次输入的新密码不一致".to_owned());
+            return false;
+        }
+        if !encrypted && self.new_archive_password.is_empty() {
+            self.status = JobStatus::Error("请输入要设置的新密码".to_owned());
+            return false;
+        }
+        let old_password = (!self.current_archive_password.is_empty())
+            .then(|| self.current_archive_password.clone());
+        let new_password =
+            (!self.new_archive_password.is_empty()).then(|| self.new_archive_password.clone());
+        let (sender, receiver) = mpsc::channel();
+        let repaint = context.clone();
+        self.worker = Some(receiver);
+        self.reload_archive_after_job = true;
+        self.pending_password_after_job = Some(new_password.clone().unwrap_or_default());
+        self.status = JobStatus::Running {
+            operation: if new_password.is_some() {
+                "正在设置 ZIP 密码"
+            } else {
+                "正在移除 ZIP 密码"
+            },
+            completed: 0,
+            total: 0,
+            current: String::new(),
+        };
+        self.show_progress_dialog = true;
+        thread::spawn(move || {
+            let result = archive::rewrite_zip_password(
+                &archive_path,
+                old_password.as_deref(),
+                new_password.as_deref(),
+                |progress| {
+                    let _ = sender.send(WorkerMessage::Progress(progress));
+                    repaint.request_repaint();
+                },
+            )
+            .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(WorkerMessage::Finished(result));
+            repaint.request_repaint();
+        });
+        true
+    }
+
+    fn show_password_management_dialog(&mut self, context: &egui::Context) {
+        if !self.show_password_dialog {
+            return;
+        }
+        let mode = self.password_dialog_mode;
+        let encrypted = self.archive_entries.iter().any(|entry| entry.encrypted);
+        let mut apply = false;
+        let close = show_native_popup(
+            context,
+            "miaozip_password",
+            "密码 - 妙压",
+            [
+                500.0,
+                if mode == PasswordDialogMode::Unlock {
+                    250.0
+                } else {
+                    350.0
+                },
+            ],
+            |ui, close| {
+                operation_heading(
+                    ui,
+                    if mode == PasswordDialogMode::Unlock {
+                        "输入 ZIP 密码"
+                    } else if encrypted {
+                        "修改或移除密码"
+                    } else {
+                        "设置 ZIP 密码"
+                    },
+                    "ZIP 文件内容使用 AES-256 加密",
+                );
+                ui.add_space(8.0);
+                if mode == PasswordDialogMode::Unlock || encrypted {
+                    ui.label("当前密码：");
+                    ui.add_sized(
+                        [440.0, 27.0],
+                        egui::TextEdit::singleline(&mut self.current_archive_password)
+                            .password(true),
+                    );
+                }
+                if mode == PasswordDialogMode::Change {
+                    ui.add_space(7.0);
+                    ui.label(if encrypted {
+                        "新密码（留空表示移除密码）："
+                    } else {
+                        "新密码："
+                    });
+                    ui.add_sized(
+                        [440.0, 27.0],
+                        egui::TextEdit::singleline(&mut self.new_archive_password).password(true),
+                    );
+                    ui.label("确认新密码：");
+                    ui.add_sized(
+                        [440.0, 27.0],
+                        egui::TextEdit::singleline(&mut self.new_archive_password_confirm)
+                            .password(true),
+                    );
+                }
+                ui.add_space(10.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("取消").clicked() {
+                        *close = true;
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(if mode == PasswordDialogMode::Unlock {
+                                    "解锁"
+                                } else {
+                                    "应用"
+                                })
+                                .color(egui::Color32::WHITE),
+                            )
+                            .fill(BLUE),
+                        )
+                        .clicked()
+                    {
+                        apply = true;
+                    }
+                });
+            },
+        );
+        if apply && mode == PasswordDialogMode::Unlock {
+            let Some(path) = self.opened_archive.clone() else {
+                self.show_password_dialog = false;
+                return;
+            };
+            match archive::validate_zip_password(&path, &self.current_archive_password) {
+                Ok(()) => {
+                    self.archive_password = self.current_archive_password.clone();
+                    self.status = JobStatus::Success("ZIP 密码正确，已解锁当前会话".to_owned());
+                    self.show_password_dialog = false;
+                }
+                Err(error) => self.status = JobStatus::Error(format!("无法解锁 ZIP：{error:#}")),
+            }
+        } else if apply && self.start_password_rewrite(context) {
+            self.show_password_dialog = false;
+        } else if close {
+            self.show_password_dialog = false;
+        }
+    }
+
+    fn create_self_extracting_archive(&mut self, context: &egui::Context) {
+        let Some(zip_path) = self.opened_archive.clone() else {
+            self.status = JobStatus::Error("请先打开 ZIP 压缩包".to_owned());
+            return;
+        };
+        if ArchiveFormat::from_path(&zip_path) != Some(ArchiveFormat::Zip) {
+            self.status = JobStatus::Error("自解压文件目前只支持 ZIP".to_owned());
+            return;
+        }
+        let (extension, filter_name) = if cfg!(windows) {
+            ("exe", "Windows 自解压程序")
+        } else {
+            ("run", "自解压程序")
+        };
+        let suggested = format!(
+            "{}.{}",
+            zip_path.file_stem().unwrap_or_default().to_string_lossy(),
+            extension
+        );
+        let Some(output) = FileDialog::new()
+            .add_filter(filter_name, &[extension])
+            .set_file_name(suggested)
+            .save_file()
+        else {
+            return;
+        };
+        let output = if output.extension().is_none() {
+            output.with_extension(extension)
+        } else {
+            output
+        };
+        let Ok(stub) = std::env::current_exe() else {
+            self.status = JobStatus::Error("无法定位妙压程序文件".to_owned());
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        let repaint = context.clone();
+        self.worker = Some(receiver);
+        self.status = JobStatus::Running {
+            operation: "正在创建自解压文件",
+            completed: 0,
+            total: 1,
+            current: output.display().to_string(),
+        };
+        self.show_progress_dialog = true;
+        thread::spawn(move || {
+            let result = archive::create_self_extracting(&stub, &zip_path, &output)
+                .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(WorkerMessage::Finished(result));
+            repaint.request_repaint();
+        });
+    }
+
     fn show_optical_dialog(&mut self, context: &egui::Context) {
         if !self.show_optical_dialog {
             return;
@@ -2581,6 +3397,14 @@ impl eframe::App for MiaoZipApp {
             return;
         }
 
+        if self.context_only_extract {
+            self.show_context_extract_root(ui);
+            if self.is_running() {
+                context.request_repaint_after(Duration::from_millis(100));
+            }
+            return;
+        }
+
         self.show_shell(ui);
 
         self.show_archive_open_confirmation(&context);
@@ -2590,8 +3414,10 @@ impl eframe::App for MiaoZipApp {
         self.show_toolbox_dialog(&context);
         self.show_optical_dialog(&context);
         self.show_create_archive_dialog(&context);
+        self.show_add_to_archive_dialog(&context);
         self.show_extract_archive_dialog(&context);
         self.show_delete_confirmation(&context);
+        self.show_password_management_dialog(&context);
         self.show_information_dialog(&context);
         self.show_about_dialog(&context);
         self.show_formats_dialog(&context);
@@ -3283,16 +4109,19 @@ mod tests {
                 path: "folder/a.txt".to_owned(),
                 is_directory: false,
                 size: Some(3),
+                encrypted: false,
             },
             archive::ArchiveListEntry {
                 path: "folder/nested/b.txt".to_owned(),
                 is_directory: false,
                 size: Some(5),
+                encrypted: false,
             },
             archive::ArchiveListEntry {
                 path: "root.txt".to_owned(),
                 is_directory: false,
                 size: Some(7),
+                encrypted: false,
             },
         ];
         let root = archive_children(&items, "");

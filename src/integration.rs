@@ -37,6 +37,9 @@ pub enum LaunchAction {
     RegisterIntegration,
     SetDefaultArchives,
     RemoveContextMenu,
+    UnregisterIntegration,
+    FirstRun,
+    SelfExtract(PathBuf),
     Invalid(String),
 }
 
@@ -55,6 +58,8 @@ impl LaunchAction {
             Some("--register-integration") if remaining.is_empty() => Self::RegisterIntegration,
             Some("--set-default-archives") if remaining.is_empty() => Self::SetDefaultArchives,
             Some("--remove-context-menu") if remaining.is_empty() => Self::RemoveContextMenu,
+            Some("--unregister-integration") if remaining.is_empty() => Self::UnregisterIntegration,
+            Some("--first-run") if remaining.is_empty() => Self::FirstRun,
             Some("--add") if !remaining.is_empty() => Self::Add(remaining),
             Some("--add-context") if !remaining.is_empty() => Self::AddContext(remaining),
             Some("--open") if remaining.len() == 1 => {
@@ -337,6 +342,48 @@ mod platform {
     fn is_legacy_handler(prog_id: &str) -> bool {
         prog_id.to_ascii_lowercase().starts_with("zipdesk.")
             || prog_id.eq_ignore_ascii_case(r"Applications\zipdesk.exe")
+    }
+
+    fn is_miaozip_handler(prog_id: &str) -> bool {
+        prog_id.to_ascii_lowercase().starts_with("miaozip.")
+            || prog_id.eq_ignore_ascii_case(r"Applications\miaozip.exe")
+    }
+
+    fn key_owned(path: &str) -> io::Result<bool> {
+        match hkcu().open_subkey_with_flags(path, KEY_READ) {
+            Ok(key) => Ok(key
+                .get_value::<String, _>(OWNER_VALUE)
+                .is_ok_and(|owner| owner == APP_NAME)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn delete_owned_key(path: &str) -> io::Result<()> {
+        if key_owned(path)? {
+            match hkcu().delete_subkey_all(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_value_if_present(key: &RegKey, name: &str) -> io::Result<()> {
+        match key.delete_value(name) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn remember_error(first_error: &mut Option<io::Error>, result: io::Result<()>) {
+        if first_error.is_none()
+            && let Err(error) = result
+        {
+            *first_error = Some(error);
+        }
     }
 
     fn legacy_key_owned(path: &str) -> io::Result<bool> {
@@ -882,6 +929,138 @@ mod platform {
         Ok(())
     }
 
+    /// Removes only integration records explicitly owned by MiaoZip. Windows may
+    /// protect UserChoice, so a protected selection is left for the shell to repair
+    /// after its now-missing handler is removed.
+    pub fn unregister_integration() -> io::Result<()> {
+        let root = hkcu();
+        let mut first_error = None;
+
+        for (path, _, _) in verbs() {
+            remember_error(&mut first_error, delete_owned_key(&path));
+        }
+
+        let registered_path = r"Software\RegisteredApplications";
+        match root.open_subkey_with_flags(registered_path, KEY_READ | KEY_WRITE) {
+            Ok(registered) => {
+                if registered
+                    .get_value::<String, _>(APP_NAME)
+                    .is_ok_and(|path| path == r"Software\MiaoZip\Capabilities")
+                {
+                    remember_error(
+                        &mut first_error,
+                        delete_value_if_present(&registered, APP_NAME),
+                    );
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => remember_error(&mut first_error, Err(error)),
+        }
+
+        remember_error(
+            &mut first_error,
+            delete_owned_key(r"Software\Classes\Applications\miaozip.exe"),
+        );
+        remember_error(
+            &mut first_error,
+            delete_owned_key(r"Software\MiaoZip\Capabilities"),
+        );
+
+        let mut removed_prog_ids = std::collections::HashSet::new();
+        for (extension, prog_id, _) in FILE_ASSOCIATIONS {
+            let extension_path = format!(r"Software\Classes\{extension}");
+            match root.open_subkey_with_flags(&extension_path, KEY_READ | KEY_WRITE) {
+                Ok(extension_key) => {
+                    if extension_key
+                        .get_value::<String, _>("")
+                        .is_ok_and(|handler| is_miaozip_handler(&handler))
+                    {
+                        remember_error(
+                            &mut first_error,
+                            delete_value_if_present(&extension_key, ""),
+                        );
+                    }
+                    match extension_key
+                        .open_subkey_with_flags("OpenWithProgids", KEY_READ | KEY_WRITE)
+                    {
+                        Ok(open_with) => remember_error(
+                            &mut first_error,
+                            delete_value_if_present(&open_with, prog_id),
+                        ),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => remember_error(&mut first_error, Err(error)),
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => remember_error(&mut first_error, Err(error)),
+            }
+            remember_error(
+                &mut first_error,
+                delete_owned_key(&format!(r"{extension_path}\DefaultIcon")),
+            );
+
+            let explorer_path =
+                format!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\{extension}");
+            match root.open_subkey_with_flags(
+                format!(r"{explorer_path}\OpenWithProgids"),
+                KEY_READ | KEY_WRITE,
+            ) {
+                Ok(open_with) => remember_error(
+                    &mut first_error,
+                    delete_value_if_present(&open_with, prog_id),
+                ),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => remember_error(&mut first_error, Err(error)),
+            }
+
+            let user_choice_path = format!(r"{explorer_path}\UserChoice");
+            let selected_by_user = root
+                .open_subkey_with_flags(&user_choice_path, KEY_READ)
+                .and_then(|key| key.get_value::<String, _>("ProgId"))
+                .is_ok_and(|handler| is_miaozip_handler(&handler));
+            if selected_by_user {
+                match root.delete_subkey_all(&user_choice_path) {
+                    Ok(()) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                        ) => {}
+                    Err(error) => remember_error(&mut first_error, Err(error)),
+                }
+            }
+
+            if removed_prog_ids.insert(prog_id) {
+                remember_error(
+                    &mut first_error,
+                    delete_owned_key(&format!(r"Software\Classes\{prog_id}")),
+                );
+            }
+        }
+
+        if let Ok(path) = icon_path() {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => remember_error(&mut first_error, Err(error)),
+            }
+            if let Some(icons) = path.parent() {
+                let _ = fs::remove_dir(icons);
+                if let Some(app_data) = icons.parent() {
+                    let _ = fs::remove_dir(app_data);
+                }
+            }
+        }
+
+        // Remove only an empty parent key; never erase unrelated app settings.
+        let _ = root.delete_subkey(r"Software\MiaoZip");
+        notify_association_changed();
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -934,6 +1113,9 @@ mod platform {
             assert!(is_legacy_handler(r"Applications\zipdesk.exe"));
             assert!(!is_legacy_handler("MiaoZip.Zip"));
             assert!(!is_legacy_handler("CompressedFolder"));
+            assert!(is_miaozip_handler("MiaoZip.Zip"));
+            assert!(is_miaozip_handler(r"Applications\miaozip.exe"));
+            assert!(!is_miaozip_handler("CompressedFolder"));
         }
 
         #[test]
@@ -1190,6 +1372,13 @@ mod platform {
 
     pub fn unregister_context_menu() -> io::Result<()> {
         Err(unsupported_context_menu())
+    }
+
+    pub fn unregister_integration() -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Linux 软件包管理器负责移除桌面文件和文件关联",
+        ))
     }
 
     #[cfg(test)]
@@ -1478,6 +1667,13 @@ mod platform {
         Err(unsupported_context_menu())
     }
 
+    pub fn unregister_integration() -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "macOS 由 Launch Services 在移除应用后更新文件关联",
+        ))
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1548,13 +1744,16 @@ mod platform {
     pub fn unregister_context_menu() -> io::Result<()> {
         Err(unsupported())
     }
+    pub fn unregister_integration() -> io::Result<()> {
+        Err(unsupported())
+    }
 }
 
 pub use platform::{
     collect_context_selection, context_menu_registered, default_association_count,
     default_candidate_registered, is_default_zip, open_default_apps_settings,
     register_context_menu, register_default_candidate, set_default_associations,
-    unregister_context_menu,
+    unregister_context_menu, unregister_integration,
 };
 
 #[cfg(test)]
@@ -1641,6 +1840,14 @@ mod tests {
         assert_eq!(
             LaunchAction::parse([OsString::from("--remove-context-menu")]),
             LaunchAction::RemoveContextMenu
+        );
+        assert_eq!(
+            LaunchAction::parse([OsString::from("--unregister-integration")]),
+            LaunchAction::UnregisterIntegration
+        );
+        assert_eq!(
+            LaunchAction::parse([OsString::from("--first-run")]),
+            LaunchAction::FirstRun
         );
         assert!(matches!(
             LaunchAction::parse([

@@ -96,6 +96,10 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $nsisArguments = @(
+    # The script is UTF-8 without a BOM. Do not let makensis fall back to the
+    # build machine's ANSI code page or Chinese product names become mojibake.
+    '/INPUTCHARSET',
+    'UTF8',
     '/V2',
     "/DVERSION=$Version",
     "/DARCHITECTURE=$Architecture",

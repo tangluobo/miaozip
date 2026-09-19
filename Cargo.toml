@@ -18,7 +18,7 @@ eframe = { version = "0.36.2", default-features = false, features = [
 rfd = "0.17.2"
 serde = { version = "1", features = ["derive"] }
 walkdir = "2.5"
-zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "8.6.0", default-features = false, features = ["aes-crypto", "deflate-flate2-zlib-rs"] }
 tar = "0.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 bzip2 = "0.6"

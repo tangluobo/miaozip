@@ -4,10 +4,20 @@ const MAX_OPEN_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Extracts one regular file into a caller-owned temporary directory. The
 /// caller must keep that directory alive while the external application uses it.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn extract_entry_for_open(
     archive_path: &Path,
     entry_name: &str,
     destination: &Path,
+) -> Result<PathBuf> {
+    extract_entry_for_open_with_password(archive_path, entry_name, destination, None)
+}
+
+pub fn extract_entry_for_open_with_password(
+    archive_path: &Path,
+    entry_name: &str,
+    destination: &Path,
+    password: Option<&str>,
 ) -> Result<PathBuf> {
     let relative = safe_archive_name(entry_name)?;
     let format = ArchiveFormat::from_path(archive_path)
@@ -22,7 +32,7 @@ pub fn extract_entry_for_open(
     reject_symlink(&output)?;
 
     match format {
-        ArchiveFormat::Zip => extract_zip_entry(archive_path, &relative, &output)?,
+        ArchiveFormat::Zip => extract_zip_entry(archive_path, &relative, &output, password)?,
         ArchiveFormat::SevenZip => extract_7z_entry(archive_path, &relative, &output)?,
         ArchiveFormat::Rar => extract_rar_entry(archive_path, &relative, &output, destination)?,
         ArchiveFormat::Gzip | ArchiveFormat::Bzip2 | ArchiveFormat::Xz | ArchiveFormat::Zstd => {
@@ -53,19 +63,31 @@ fn copy_limited(input: &mut dyn Read, output: &Path, advertised_size: Option<u64
     Ok(())
 }
 
-fn extract_zip_entry(archive_path: &Path, requested: &Path, output: &Path) -> Result<()> {
+fn extract_zip_entry(
+    archive_path: &Path,
+    requested: &Path,
+    output: &Path,
+    password: Option<&str>,
+) -> Result<()> {
     let mut archive =
         ZipArchive::new(File::open(archive_path)?).context("文件不是有效的 ZIP 压缩包")?;
     for index in 0..archive.len() {
-        let mut entry = archive.by_index(index)?;
+        let encrypted = archive.by_index_raw(index)?.encrypted();
+        let mut entry = if encrypted {
+            let password = password
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("ZIP 已加密，请先点击工具栏“密码”输入密码"))?;
+            archive
+                .by_index_decrypt(index, password.as_bytes())
+                .context("ZIP 密码错误")?
+        } else {
+            archive.by_index(index)?
+        };
         if safe_archive_name(entry.name())? != requested {
             continue;
         }
         if entry.is_dir() || entry.is_symlink() {
             bail!("不能直接打开目录、链接或特殊文件：{}", entry.name());
-        }
-        if entry.encrypted() {
-            bail!("暂不支持加密 ZIP：{}", entry.name());
         }
         let size = entry.size();
         return copy_limited(&mut entry, output, Some(size));

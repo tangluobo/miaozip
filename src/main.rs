@@ -22,7 +22,17 @@ pub(crate) fn app_icon() -> Arc<egui::IconData> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let launch_action = match integration::LaunchAction::from_env() {
+    let requested_action = integration::LaunchAction::from_env();
+    let requested_action = if requested_action == integration::LaunchAction::Normal {
+        std::env::current_exe()
+            .ok()
+            .filter(|path| archive::is_self_extracting(path))
+            .map(integration::LaunchAction::SelfExtract)
+            .unwrap_or(requested_action)
+    } else {
+        requested_action
+    };
+    let launch_action = match requested_action {
         integration::LaunchAction::RegisterIntegration => {
             integration::register_default_candidate()?;
             #[cfg(windows)]
@@ -44,6 +54,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             integration::unregister_context_menu()?;
             return Ok(());
         }
+        integration::LaunchAction::UnregisterIntegration => {
+            integration::unregister_integration()?;
+            return Ok(());
+        }
         integration::LaunchAction::AddContext(paths) => {
             match integration::collect_context_selection(paths) {
                 Some(paths) => integration::LaunchAction::AddContext(paths),
@@ -53,6 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         action => action,
     };
     let context_add = matches!(&launch_action, integration::LaunchAction::AddContext(_));
+    let context_extract = matches!(&launch_action, integration::LaunchAction::ExtractHere(_));
     let window_icon = app_icon();
     let options = eframe::NativeOptions {
         viewport: if context_add {
@@ -61,6 +76,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .with_icon(window_icon.clone())
                 .with_inner_size([630.0, 345.0])
                 .with_min_inner_size([630.0, 345.0])
+                .with_resizable(false)
+        } else if context_extract {
+            egui::ViewportBuilder::default()
+                .with_title("解压进度 - 妙压")
+                .with_icon(window_icon.clone())
+                .with_inner_size([520.0, 230.0])
+                .with_min_inner_size([520.0, 230.0])
                 .with_resizable(false)
         } else {
             egui::ViewportBuilder::default()

@@ -12,6 +12,29 @@
     <Icon Id="MiaoZipIcon" SourceFile="$(var.IconPath)" />
     <Property Id="ARPPRODUCTICON" Value="MiaoZipIcon" />
 
+    <CustomAction
+      Id="CleanupMiaoZipIntegration"
+      FileRef="MiaoZipExecutable"
+      ExeCommand="--unregister-integration"
+      Execute="immediate"
+      Return="ignore" />
+    <CustomAction
+      Id="LaunchMiaoZipFirstRun"
+      FileRef="MiaoZipExecutable"
+      ExeCommand="--first-run"
+      Execute="immediate"
+      Return="asyncNoWait" />
+    <InstallExecuteSequence>
+      <Custom
+        Action="CleanupMiaoZipIntegration"
+        Before="RemoveFiles"
+        Condition="REMOVE~=&quot;ALL&quot;" />
+      <Custom
+        Action="LaunchMiaoZipFirstRun"
+        After="InstallFinalize"
+        Condition="NOT Installed AND UILevel &gt;= 4" />
+    </InstallExecuteSequence>
+
     <StandardDirectory Id="ProgramFiles6432Folder">
       <Directory Id="INSTALLFOLDER" Name="MiaoZip" />
     </StandardDirectory>
@@ -22,7 +45,7 @@
             Id="StartMenuShortcut"
             Name="妙压"
             Description="妙压压缩文件管理器"
-            Target="[#MiaoZipExecutable]"
+            Target="[INSTALLFOLDER]miaozip.exe"
             WorkingDirectory="INSTALLFOLDER"
             Icon="MiaoZipIcon"
             Advertise="no" />
@@ -36,7 +59,9 @@
             KeyPath="yes" />
         </Component>
       </Directory>
+      <Directory Id="LegacyMojibakeProgramsFolder" Name="å¦™åŽ‹" />
     </StandardDirectory>
+    <StandardDirectory Id="DesktopFolder" />
 
     <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
       <Component Id="ApplicationFiles" Guid="*">
@@ -44,6 +69,20 @@
         <File Id="ReadmeFile" Source="$(var.ReadmePath)" Name="README.md" />
         <File Id="LicenseFile" Source="$(var.LicensePath)" Name="LICENSE.txt" />
         <File Id="NoticesFile" Source="$(var.NoticesPath)" Name="THIRD_PARTY_NOTICES.md" />
+        <RemoveFile
+          Id="RemoveLegacyMojibakeStartMenuFiles"
+          Directory="LegacyMojibakeProgramsFolder"
+          Name="*"
+          On="both" />
+        <RemoveFolder
+          Id="RemoveLegacyMojibakeStartMenuFolder"
+          Directory="LegacyMojibakeProgramsFolder"
+          On="both" />
+        <RemoveFile
+          Id="RemoveLegacyMojibakeDesktopShortcut"
+          Directory="DesktopFolder"
+          Name="å¦™åŽ‹.lnk"
+          On="both" />
       </Component>
     </ComponentGroup>
 

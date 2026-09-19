@@ -124,9 +124,13 @@ impl MiaoZipApp {
                 let enabled = [
                     true,
                     true,
-                    !self.selected_paths.is_empty(),
-                    true,
-                    true,
+                    !self.selected_paths.is_empty() || self.selected_archive_item.is_some(),
+                    self.opened_archive.as_ref().is_some_and(|path| {
+                        ArchiveFormat::from_path(path) == Some(ArchiveFormat::Zip)
+                    }),
+                    self.opened_archive.as_ref().is_some_and(|path| {
+                        ArchiveFormat::from_path(path) == Some(ArchiveFormat::Zip)
+                    }),
                     true,
                 ];
                 for index in 0..6 {
@@ -160,14 +164,8 @@ impl MiaoZipApp {
                             0 => self.prepare_add_dialog(),
                             1 => self.prepare_extract_dialog(),
                             2 => self.show_delete_dialog = true,
-                            3 => {
-                                self.status =
-                                    JobStatus::Error("ZIP 密码管理功能尚未实现".to_owned())
-                            }
-                            4 => {
-                                self.status =
-                                    JobStatus::Error("跨平台自解压模块尚未实现".to_owned())
-                            }
+                            3 => self.open_password_dialog(),
+                            4 => self.create_self_extracting_archive(ui.ctx()),
                             _ => self.show_toolbox_dialog = true,
                         }
                     }
@@ -1200,6 +1198,14 @@ impl MiaoZipApp {
                             };
                             if ui.button(title).clicked() {
                                 self.activate_file_entry(entry.clone());
+                                ui.close();
+                            }
+                            if self.opened_archive.as_ref().is_some_and(|path| {
+                                ArchiveFormat::from_path(path) == Some(ArchiveFormat::Zip)
+                            }) && ui.button("从压缩包删除").clicked()
+                            {
+                                self.selected_archive_item = Some(entry.path.clone());
+                                self.show_delete_dialog = true;
                                 ui.close();
                             }
                         });
